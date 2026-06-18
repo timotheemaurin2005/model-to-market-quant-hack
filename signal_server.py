@@ -38,6 +38,9 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from statsmodels.tsa.stattools import adfuller
 
+from conformal import fit_two_piece_cp, predict_interval, ConformalFit
+from kalman_live import load_config as load_kalman_config, current_beta as kalman_current_beta
+
 logger = logging.getLogger("signal_server")
 
 # ── Load .env ────────────────────────────────────────────────────────────────
@@ -78,19 +81,22 @@ class TierType(str, Enum):
 
 class SignalResponse(BaseModel):
     """Structured signal returned by the /signal endpoint."""
-    pair: str = Field(..., description="Pair name, e.g. XAUUSD/XAGUSD")
+    pair: str = Field(..., description="Pair name, e.g. EURUSD/EURGBP")
     action: ActionType = Field(..., description="Trade action: ENTER, CLOSE, or HOLD")
     z_score: float = Field(..., description="Current Z-score of the spread")
-    beta: float = Field(..., description="Dynamic Kalman hedge ratio")
+    beta: float = Field(..., description="Hedge ratio (Kalman dynamic or OLS fallback)")
+    beta_source: str = Field(
+        "ols_fallback", description="Hedge ratio source: 'kalman' or 'ols_fallback'"
+    )
     r_value: float = Field(
-        ..., description="Conformal-prediction asymmetric scale ratio"
+        ..., description="Two-piece conformal scale ratio σ̂₂/σ̂₁"
     )
     half_life_hours: float = Field(
         ..., description="OU half-life in hours"
     )
     tier: TierType = Field(..., description="Conviction tier: HIGH, MEDIUM, or LOW")
-    leg_buy: str = Field(..., description="Symbol to buy, e.g. 'BUY 1.2 XAUUSD'")
-    leg_sell: str = Field(..., description="Symbol to sell, e.g. 'SELL 0.8 XAGUSD'")
+    leg_buy: str = Field(..., description="Symbol to buy, e.g. 'BUY 1.2 EURUSD'")
+    leg_sell: str = Field(..., description="Symbol to sell, e.g. 'SELL 0.8 EURGBP'")
     size_pct: float = Field(
         ..., description="Position size as % of guardrail ceiling"
     )
@@ -99,6 +105,21 @@ class SignalResponse(BaseModel):
     )
     narrative: str = Field(
         ..., description="2-sentence trade rationale from Nemotron"
+    )
+    conformal_width: float = Field(
+        0.0, description="Conformal interval width q·(σ̂₁+σ̂₂)"
+    )
+    conformal_L: float = Field(
+        0.0, description="Conformal lower bound"
+    )
+    conformal_U: float = Field(
+        0.0, description="Conformal upper bound"
+    )
+    coverage: float = Field(
+        0.0, description="Holdout coverage of conformal interval"
+    )
+    cp_status: str = Field(
+        "REVIEW", description="Conformal validation: PASS or REVIEW"
     )
 
 
@@ -147,25 +168,49 @@ def validate_guardrails(
 
 # ── Tiered conviction sizing ────────────────────────────────────────────────
 
+# Width modulation constant from CLAUDE.md: size = tier_base / (1 + λ·width_norm)
+WIDTH_LAMBDA = 1.0
+
+
 def compute_tier_and_size(
     z_score: float,
     r_value: float,
     guardrail_ceiling: float = MAX_SINGLE_PCT,
+    width_norm: float = 0.0,
+    cp_status: str = "PASS",
 ) -> tuple[TierType, float]:
     """Tiered conviction sizing from CLAUDE.md strategy parameters.
 
     HIGH:   |Z| > 2.5 AND r > 4  → 0.90 × guardrail ceiling
     MEDIUM: |Z| > 2.0 AND r > 3  → 0.60 × guardrail ceiling
     LOW:    otherwise             → 0.30 × guardrail ceiling
+
+    Width modulation: size = tier_base / (1 + λ·width_norm) × ceiling.
+    cp_status == 'REVIEW': cap at LOW (CLAUDE.md: REVIEW = in-sample only).
     """
     abs_z = abs(z_score)
 
+    # Determine base tier from Z and r gates
     if abs_z > 2.5 and r_value > 4.0:
-        return TierType.HIGH, round(0.90 * guardrail_ceiling, 2)
+        tier = TierType.HIGH
+        tier_base = 0.90
     elif abs_z > 2.0 and r_value > 3.0:
-        return TierType.MEDIUM, round(0.60 * guardrail_ceiling, 2)
+        tier = TierType.MEDIUM
+        tier_base = 0.60
     else:
-        return TierType.LOW, round(0.30 * guardrail_ceiling, 2)
+        tier = TierType.LOW
+        tier_base = 0.30
+
+    # REVIEW pairs: cap at LOW (CLAUDE.md: "REVIEW = looked good in-sample only")
+    if cp_status == "REVIEW" and tier != TierType.LOW:
+        tier = TierType.LOW
+        tier_base = 0.30
+
+    # Width modulation: wider interval → smaller size (more uncertainty)
+    modulated = tier_base / (1.0 + WIDTH_LAMBDA * max(width_norm, 0.0))
+    size_pct = round(modulated * guardrail_ceiling, 2)
+
+    return tier, size_pct
 
 
 # ── Data engine: parquet + yfinance fallback ─────────────────────────────────
@@ -213,6 +258,10 @@ HL_MAX_HOURS = 120.0
 
 # Cached bar series per symbol
 _bar_cache: dict[str, pd.Series] = {}
+
+# ── Kalman live config (TASK B: dynamic beta for PASS pairs) ────────────────
+KALMAN_CONFIG_PATH = os.getenv("KALMAN_CONFIG_PATH", "./outputs/kalman_config.json")
+_kalman_configs: dict[str, dict] = {}
 
 
 def _has_parquet_data() -> bool:
@@ -343,10 +392,11 @@ def _ou_half_life(spread: pd.Series) -> float:
 
 
 def _screen_pair(sym_a: str, sym_b: str) -> dict:
-    """Run cointegration + half-life screen on a pair using real bar data.
+    """Run cointegration + half-life + conformal screen on a pair.
 
-    Returns a dict with all signal fields. Does NOT apply guardrails or
-    sizing — that's the endpoint's job.
+    Returns a dict with all signal fields including real conformal
+    r_value (σ̂₂/σ̂₁), interval bounds, coverage, and status.
+    Does NOT apply guardrails or sizing — that's the endpoint's job.
     """
     bars_a = _load_symbol_bars(sym_a)
     bars_b = _load_symbol_bars(sym_b)
@@ -359,7 +409,9 @@ def _screen_pair(sym_a: str, sym_b: str) -> dict:
     if len(px) < 100:
         raise ValueError(f"{sym_a}/{sym_b}: only {len(px)} overlapping bars")
 
-    # OLS hedge ratio: A = alpha + beta * B + spread
+    # OLS hedge ratio: A = alpha + beta * B + spread (static — used for the
+    # cointegration/half-life screen, which is a property of the pair, not
+    # of which beta source is live).
     x = sm.add_constant(px[sym_b].values)
     ols = sm.OLS(px[sym_a].values, x).fit()
     alpha, beta = float(ols.params[0]), float(ols.params[1])
@@ -373,6 +425,35 @@ def _screen_pair(sym_a: str, sym_b: str) -> dict:
     hl_bars = _ou_half_life(spread)
     hl_hours = hl_bars * BAR_MINUTES / 60.0
 
+    # ── Dynamic beta from the frozen Kalman config, if this pair has one ────
+    # Never run EM here, never recalibrate Q/R live — only step filter_update
+    # forward using FROZEN cfg.Q/cfg.R. A PASS config always wins over OLS.
+    beta_source = "ols_fallback"
+    pair_key = f"{sym_a}/{sym_b}"
+    kcfg = _kalman_configs.get(pair_key)
+    refused_bar_mismatch = False
+    if kcfg is not None:
+        if kcfg["bar_minutes"] != BAR_MINUTES:
+            logger.warning(
+                f"{pair_key}: Kalman config bar_minutes={kcfg['bar_minutes']} "
+                f"!= live BAR_MINUTES={BAR_MINUTES} — refusing pair (REVIEW)"
+            )
+            refused_bar_mismatch = True
+        elif kcfg["status"] == "PASS":
+            alpha_t, beta_t, dyn_spread = kalman_current_beta(
+                kcfg, px[sym_a], px[sym_b]
+            )
+            alpha, beta = alpha_t, beta_t
+            spread = dyn_spread
+            beta_source = "kalman"
+        else:
+            logger.warning(
+                f"{pair_key}: Kalman config status={kcfg['status']} "
+                "(not PASS) — keeping OLS beta path"
+            )
+    else:
+        logger.warning(f"{pair_key}: no Kalman config — OLS fallback")
+
     # Z-score
     mu, sigma = float(spread.mean()), float(spread.std())
     z_score = float((spread.iloc[-1] - mu) / sigma) if sigma > 0 else 0.0
@@ -380,12 +461,15 @@ def _screen_pair(sym_a: str, sym_b: str) -> dict:
     # Cointegration pass: ADF p < 0.05 AND tradeable half-life (2-120h)
     passes_coint = adf_p < 0.05
     passes_hl = np.isfinite(hl_hours) and HL_MIN_HOURS <= hl_hours <= HL_MAX_HOURS
-    passes_screen = passes_coint and passes_hl
+    passes_screen = passes_coint and passes_hl and not refused_bar_mismatch
 
-    # r_value: use OLS R² as a proxy for conformal-prediction scale ratio.
-    # Map R² → scale ratio r ∈ [1, 10] for tiered sizing.
-    r_squared = float(ols.rsquared)
-    r_value = round(1.0 + 9.0 * r_squared, 1)  # R²=1 → r=10, R²=0 → r=1
+    # ── Two-piece conformal predictor (REAL r_value) ─────────────────
+    cp_fit = fit_two_piece_cp(spread.values, alpha=0.10)
+    cp_mu, cp_L, cp_U, cp_width, cp_r = predict_interval(
+        cp_fit, float(spread.iloc[-1])
+    )
+    # width_norm: unitless width relative to spread σ
+    width_norm = float(cp_width / sigma) if sigma > 0 else 0.0
 
     return {
         "pair": f"{sym_a}/{sym_b}",
@@ -393,7 +477,8 @@ def _screen_pair(sym_a: str, sym_b: str) -> dict:
         "symbol_b": sym_b,
         "z_score": round(z_score, 4),
         "beta": round(beta, 6),
-        "r_value": r_value,
+        "beta_source": beta_source,
+        "r_value": round(cp_r, 2),
         "half_life_hours": round(hl_hours, 2) if np.isfinite(hl_hours) else 999.0,
         "adf_pvalue": round(adf_p, 5),
         "passes_screen": passes_screen,
@@ -402,6 +487,13 @@ def _screen_pair(sym_a: str, sym_b: str) -> dict:
         "n_bars": len(px),
         "spread_mu": mu,
         "spread_sigma": sigma,
+        # Conformal predictor outputs
+        "conformal_width": round(cp_width, 6),
+        "conformal_L": round(cp_L, 6),
+        "conformal_U": round(cp_U, 6),
+        "coverage": cp_fit.coverage,
+        "cp_status": cp_fit.status,
+        "width_norm": round(width_norm, 4),
         # Placeholder portfolio-level metrics (conservative defaults)
         "leverage_requested": 10.0,
         "margin_usage_pct": 40.0,
@@ -472,13 +564,18 @@ def _log_startup_screening():
 
     # Screen all candidate pairs
     logger.info("── Startup pair screening (30-day window) ──")
-    header = f"{'Pair':20s} {'β':>8s} {'ADF p':>10s} {'HL (hrs)':>10s} {'Z':>8s} {'Coint':>6s} {'HL ok':>6s}"
+    header = (
+        f"{'Pair':20s} {'β':>8s} {'β src':>12s} {'ADF p':>10s} "
+        f"{'HL (hrs)':>10s} {'Z':>8s} {'Coint':>6s} {'HL ok':>6s}"
+    )
     logger.info(header)
     for sym_a, sym_b in CANDIDATE_PAIRS:
         try:
             r = _screen_pair(sym_a, sym_b)
             logger.info(
-                f"{r['pair']:20s} {r['beta']:8.4f} {r['adf_pvalue']:10.5f} "
+                f"{r['pair']:20s} {r['beta']:8.4f} "
+                f"{r.get('beta_source', 'ols_fallback'):>12s} "
+                f"{r['adf_pvalue']:10.5f} "
                 f"{r['half_life_hours']:10.2f} {r['z_score']:+8.4f} "
                 f"{'PASS' if r['passes_coint'] else 'FAIL':>6s} "
                 f"{'PASS' if r['passes_hl'] else 'FAIL':>6s}"
@@ -679,7 +776,9 @@ def format_signal_box(sig: SignalResponse) -> str:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Startup: load data, log schema, screen pairs."""
+    global _kalman_configs
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+    _kalman_configs = load_kalman_config(KALMAN_CONFIG_PATH)
     _log_startup_screening()
     yield
 
@@ -719,6 +818,7 @@ class WatchlistItem(BaseModel):
     z_score: float
     abs_z: float
     beta: float
+    beta_source: str = Field("ols_fallback", description="'kalman' or 'ols_fallback'")
     adf_pvalue: float
     half_life_hours: float
     r_value: float
@@ -727,6 +827,8 @@ class WatchlistItem(BaseModel):
     action_hint: str = Field(
         description="Quick label: ENTRY if |Z|>=2, APPROACHING if |Z|>=1.5, WATCH otherwise"
     )
+    coverage: float = Field(0.0, description="Holdout conformal coverage")
+    cp_status: str = Field("REVIEW", description="Conformal validation: PASS or REVIEW")
 
 
 class WatchlistResponse(BaseModel):
@@ -757,20 +859,27 @@ async def watchlist():
             else:
                 hint = "WATCH"
 
-            # Tier for context
-            tier, _ = compute_tier_and_size(r["z_score"], r["r_value"])
+            # Tier for context (with width modulation + REVIEW cap)
+            tier, _ = compute_tier_and_size(
+                r["z_score"], r["r_value"],
+                width_norm=r.get("width_norm", 0.0),
+                cp_status=r.get("cp_status", "REVIEW"),
+            )
 
             items.append(WatchlistItem(
                 pair=r["pair"],
                 z_score=r["z_score"],
                 abs_z=round(abs_z, 4),
                 beta=r["beta"],
+                beta_source=r.get("beta_source", "ols_fallback"),
                 adf_pvalue=r["adf_pvalue"],
                 half_life_hours=r["half_life_hours"],
                 r_value=r["r_value"],
                 passes_screen=r["passes_screen"],
                 tier=tier.value,
                 action_hint=hint,
+                coverage=r.get("coverage", 0.0),
+                cp_status=r.get("cp_status", "REVIEW"),
             ))
         except Exception as e:
             logger.warning(f"Watchlist: failed to screen {sym_a}/{sym_b}: {e}")
@@ -813,8 +922,12 @@ async def signal(pair: Optional[str] = None):
     else:
         action = ActionType.HOLD
 
-    # ── 3. Tiered conviction sizing ─────────────────────────────────────────
-    tier, size_pct = compute_tier_and_size(z_score, r_value)
+    # ── 3. Tiered conviction sizing (with width modulation + REVIEW cap) ────
+    tier, size_pct = compute_tier_and_size(
+        z_score, r_value,
+        width_norm=raw.get("width_norm", 0.0),
+        cp_status=raw.get("cp_status", "REVIEW"),
+    )
 
     # ── 4. Guardrail validation ─────────────────────────────────────────────
     guardrail = validate_guardrails(
@@ -870,6 +983,7 @@ async def signal(pair: Optional[str] = None):
         action=action,
         z_score=z_score,
         beta=beta,
+        beta_source=raw.get("beta_source", "ols_fallback"),
         r_value=r_value,
         half_life_hours=half_life_hours,
         tier=tier,
@@ -878,6 +992,11 @@ async def signal(pair: Optional[str] = None):
         size_pct=size_pct,
         passes_guardrail=guardrail.passes,
         narrative=narrative,
+        conformal_width=raw.get("conformal_width", 0.0),
+        conformal_L=raw.get("conformal_L", 0.0),
+        conformal_U=raw.get("conformal_U", 0.0),
+        coverage=raw.get("coverage", 0.0),
+        cp_status=raw.get("cp_status", "REVIEW"),
     )
 
     return format_signal_box(sig)
@@ -903,7 +1022,11 @@ async def signal_json(pair: Optional[str] = None):
     else:
         action = ActionType.HOLD
 
-    tier, size_pct = compute_tier_and_size(z_score, r_value)
+    tier, size_pct = compute_tier_and_size(
+        z_score, r_value,
+        width_norm=raw.get("width_norm", 0.0),
+        cp_status=raw.get("cp_status", "REVIEW"),
+    )
 
     guardrail = validate_guardrails(
         size_pct=size_pct,
@@ -947,6 +1070,7 @@ async def signal_json(pair: Optional[str] = None):
         action=action,
         z_score=z_score,
         beta=beta,
+        beta_source=raw.get("beta_source", "ols_fallback"),
         r_value=r_value,
         half_life_hours=half_life_hours,
         tier=tier,
@@ -955,6 +1079,11 @@ async def signal_json(pair: Optional[str] = None):
         size_pct=size_pct,
         passes_guardrail=guardrail.passes,
         narrative=narrative,
+        conformal_width=raw.get("conformal_width", 0.0),
+        conformal_L=raw.get("conformal_L", 0.0),
+        conformal_U=raw.get("conformal_U", 0.0),
+        coverage=raw.get("coverage", 0.0),
+        cp_status=raw.get("cp_status", "REVIEW"),
     )
 
 

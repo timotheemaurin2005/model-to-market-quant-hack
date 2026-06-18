@@ -21,21 +21,27 @@ Run locally during the prep window. Requires pair_screener.py in the same dir.
 """
 
 from __future__ import annotations
+import glob
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from pykalman import KalmanFilter
 
-from pair_screener import load_prices, ou_half_life  # reuse corrected loader/half-life
+from pair_screener import ou_half_life  # reuse corrected half-life logic
 
 # ---- CONFIG ----------------------------------------------------------------
-PARQUET_PATH = "/Users/timotheemaurin/Documents/data/prices.parquet"    # EDIT
-RANKED_CSV   = "/Users/timotheemaurin/Documents/data/ranked_pairs.csv"  # EDIT
-CONFIG_OUT   = "/Users/timotheemaurin/Documents/data/kalman_config.json"  # EDIT
+# Real data on disk is per-symbol tick parquet (bid/ask), not the single wide
+# prices.parquet pair_screener.py was written against — load_prices() there
+# doesn't match this schema, so we load ticks directly (see load_prices_from_ticks).
+_DEFAULT_DATA_DIR = str(Path(__file__).parent / "pricer-output-2026-05-11_2026-06-10")
+DATA_DIR   = Path(_DEFAULT_DATA_DIR)               # EDIT if data moves
+CONFIG_OUT = Path(__file__).parent / "outputs" / "kalman_config.json"
 
-BAR_MINUTES     = 15     # must match the parquet's bar size
+BAR_MINUTES     = 15     # must match signal_server.py's BAR_MINUTES (parquet path)
 CALIB_DAYS      = 30     # calibration window (recent regime)
 VALIDATION_DAYS = 7      # held-out tail inside the calib window (unseen by EM)
 WARMSTART_DAYS  = 5      # OLS tail for beta0 / alpha0 / P0
@@ -51,12 +57,47 @@ DELTA_MIN    = 1e-6     # floor: don't freeze beta into static OLS
 VAL_ADF_PMAX   = 0.05
 VAL_HL_MIN_MIN = 120    # held-out half-life still tradeable (minutes)
 
+# Watchlist pairs to calibrate. Must match signal_server.py's WATCHLIST
+# (same symbol order) so the live server's f"{sym_a}/{sym_b}" config lookup
+# key matches. XAUUSD/XAGUSD is not in this dataset (signal_server.py docstring);
+# these 5 are the curated watchlist from the real 28-pair screen on this data.
+WATCHLIST = [
+    ("AUDUSD", "USDJPY"),
+    ("USDCAD", "USDJPY"),
+    ("USDCHF", "USDJPY"),
+    ("USDCAD", "USDCHF"),
+    ("EURGBP", "EURUSD"),
+]
+
 
 # ---- helpers ---------------------------------------------------------------
-def parse_survivors(csv_path: str) -> list[tuple[str, str]]:
-    df = pd.read_csv(csv_path)
-    surv = df[df["passes_both"].astype(str).str.lower() == "true"]
-    return [tuple(p.split("/")) for p in surv["pair"]]
+def load_prices_from_ticks(data_dir: Path, symbols: list[str], bar_minutes: int) -> pd.DataFrame:
+    """Build a WIDE mid-price frame from per-symbol tick parquet files.
+
+    Mirrors signal_server._load_symbol_bars: reads {symbol}_*.parquet (time,
+    bid, ask), takes the mid, resamples to bar_minutes bars (last value).
+    """
+    series = {}
+    for sym in symbols:
+        files = sorted(glob.glob(str(data_dir / f"{sym}_*.parquet")))
+        if not files:
+            continue
+        dfs = []
+        for f in files:
+            try:
+                df = pd.read_parquet(f, engine="fastparquet", columns=["time", "bid", "ask"])
+            except Exception:
+                continue
+            df["time"] = pd.to_datetime(df["time"])
+            df["mid"] = (df["bid"] + df["ask"]) / 2.0
+            dfs.append(df[["time", "mid"]])
+        if not dfs:
+            continue
+        all_ticks = pd.concat(dfs).sort_values("time").set_index("time")
+        series[sym] = all_ticks["mid"].resample(f"{bar_minutes}min").last().dropna()
+
+    wide = pd.DataFrame(series).sort_index()
+    return wide
 
 
 def ols_warmstart(y: pd.Series, x: pd.Series):
@@ -158,12 +199,10 @@ def calibrate_pair(a: str, b: str, wide: pd.DataFrame) -> dict | None:
 
 
 def main():
-    wide = load_prices(PARQUET_PATH)
-    pairs = parse_survivors(RANKED_CSV)
-    if not pairs:
-        print("No survivors in ranked_pairs.csv (passes_both == True). Re-run screener.")
-        return
-    print(f"Calibrating {len(pairs)} survivor pair(s): {pairs}")
+    symbols = sorted({s for pair in WATCHLIST for s in pair})
+    wide = load_prices_from_ticks(DATA_DIR, symbols, BAR_MINUTES)
+    pairs = WATCHLIST
+    print(f"Calibrating {len(pairs)} watchlist pair(s): {pairs}")
 
     configs = {}
     for a, b in pairs:
@@ -177,6 +216,7 @@ def main():
               f"val_hl={v['half_life_min']}min  -> {cfg['status']}")
         configs[cfg["pair"]] = cfg
 
+    CONFIG_OUT.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_OUT, "w") as f:
         json.dump(configs, f, indent=2)
     n_pass = sum(c["status"] == "PASS" for c in configs.values())
