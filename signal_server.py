@@ -168,12 +168,27 @@ def compute_tier_and_size(
         return TierType.LOW, round(0.30 * guardrail_ceiling, 2)
 
 
-# ── Data engine: real parquet loading ────────────────────────────────────────
+# ── Data engine: parquet + yfinance fallback ─────────────────────────────────
 
 _DEFAULT_DATA_DIR = str(Path(__file__).parent / "pricer-output-2026-05-11_2026-06-10")
 DATA_DIR = Path(os.getenv("PARQUET_DIR", _DEFAULT_DATA_DIR))
-BAR_MINUTES = 15
+BAR_MINUTES = 15      # will be overridden to 60 if yfinance fallback is used
 CALIB_DAYS = 30
+
+# yfinance ticker mapping for FX pairs
+YF_TICKER_MAP = {
+    "EURUSD": "EURUSD=X",
+    "EURGBP": "EURGBP=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDJPY": "USDJPY=X",
+    "USDCAD": "USDCAD=X",
+    "USDCHF": "USDCHF=X",
+    "EURCHF": "EURCHF=X",
+    "GBPUSD": "GBPUSD=X",
+}
+
+# Module-level flag: set True when parquet is unavailable
+_use_yfinance: bool = False
 
 # Competition symbols available in the dataset
 COMPETITION_SYMBOLS = [
@@ -196,49 +211,113 @@ CANDIDATE_PAIRS = WATCHLIST
 HL_MIN_HOURS = 2.0
 HL_MAX_HOURS = 120.0
 
-# Cached 15-min bar series per symbol
+# Cached bar series per symbol
 _bar_cache: dict[str, pd.Series] = {}
 
 
+def _has_parquet_data() -> bool:
+    """Check if parquet files exist in DATA_DIR."""
+    return bool(glob.glob(str(DATA_DIR / "*.parquet")))
+
+
+def _load_symbol_yfinance(symbol: str) -> pd.Series:
+    """Fetch 30 days of 1h OHLCV from yfinance as fallback.
+
+    Uses the Close column as the price series, resampled to 1h bars.
+    """
+    import yfinance as yf
+
+    ticker = YF_TICKER_MAP.get(symbol)
+    if not ticker:
+        raise ValueError(f"No yfinance ticker mapping for {symbol}")
+
+    logger.info(f"Fetching {symbol} via yfinance ({ticker}, 30d, 1h)...")
+    df = yf.download(
+        ticker,
+        period=f"{CALIB_DAYS}d",
+        interval="1h",
+        progress=False,
+        auto_adjust=True,
+    )
+
+    if df.empty:
+        raise ValueError(f"yfinance returned no data for {ticker}")
+
+    # yf.download returns MultiIndex columns when single ticker; flatten
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    bars = df["Close"].dropna()
+    bars.name = symbol
+    bars.index = bars.index.tz_localize(None)  # strip tz for consistency
+
+    logger.info(
+        f"  yfinance {symbol}: {len(bars)} bars "
+        f"({bars.index[0]} to {bars.index[-1]})"
+    )
+    return bars
+
+
 def _load_symbol_bars(symbol: str) -> pd.Series:
-    """Load tick parquet files for a symbol, compute mid, resample to bars.
+    """Load bar data for a symbol.
+
+    Strategy:
+      1. Try parquet files from DATA_DIR (tick data → 15-min bars).
+      2. If no parquet files found, fall back to yfinance (1h bars).
 
     Uses fastparquet engine to avoid pyarrow 'Repetition level histogram'
     bug with the nested list columns in these files.
     """
+    global _use_yfinance, BAR_MINUTES
+
     if symbol in _bar_cache:
         return _bar_cache[symbol]
 
-    pattern = str(DATA_DIR / f"{symbol}_*.parquet")
-    files = sorted(glob.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No parquet files for {symbol} in {DATA_DIR}")
+    # ── Try parquet first ──────────────────────────────────────────────
+    if not _use_yfinance:
+        pattern = str(DATA_DIR / f"{symbol}_*.parquet")
+        files = sorted(glob.glob(pattern))
 
-    dfs = []
-    skipped = 0
-    for f in files:
-        try:
-            df = pd.read_parquet(f, engine="fastparquet", columns=["time", "bid", "ask"])
-        except Exception as e:
-            logger.warning(f"Skipping corrupted file {Path(f).name}: {e}")
-            skipped += 1
-            continue
-        df["time"] = pd.to_datetime(df["time"])
-        df["mid"] = (df["bid"] + df["ask"]) / 2.0
-        dfs.append(df[["time", "mid"]])
+        if files:
+            dfs = []
+            skipped = 0
+            for f in files:
+                try:
+                    df = pd.read_parquet(
+                        f, engine="fastparquet", columns=["time", "bid", "ask"]
+                    )
+                except Exception as e:
+                    logger.warning(f"Skipping corrupted file {Path(f).name}: {e}")
+                    skipped += 1
+                    continue
+                df["time"] = pd.to_datetime(df["time"])
+                df["mid"] = (df["bid"] + df["ask"]) / 2.0
+                dfs.append(df[["time", "mid"]])
 
-    if not dfs:
-        raise FileNotFoundError(f"All {len(files)} files for {symbol} are corrupted")
+            if dfs:
+                all_ticks = pd.concat(dfs).sort_values("time").set_index("time")
+                bars = all_ticks["mid"].resample(f"{BAR_MINUTES}min").last().dropna()
+                bars.name = symbol
+                skip_note = f" ({skipped} skipped)" if skipped else ""
+                logger.info(
+                    f"Loaded {symbol}: {len(files) - skipped}/{len(files)} "
+                    f"files{skip_note} → {len(bars)} bars "
+                    f"({bars.index[0]} to {bars.index[-1]})"
+                )
+                _bar_cache[symbol] = bars
+                return bars
 
-    all_ticks = pd.concat(dfs).sort_values("time").set_index("time")
-    bars = all_ticks["mid"].resample(f"{BAR_MINUTES}min").last().dropna()
-    bars.name = symbol
+        # No parquet files → switch to yfinance for all symbols
+        if not _use_yfinance:
+            logger.warning(
+                f"No parquet files for {symbol} in {DATA_DIR} — "
+                "switching to yfinance fallback for ALL symbols"
+            )
+            _use_yfinance = True
+            BAR_MINUTES = 60  # yfinance gives 1h bars
 
-    skip_note = f" ({skipped} skipped)" if skipped else ""
-    logger.info(
-        f"Loaded {symbol}: {len(files) - skipped}/{len(files)} files{skip_note} "
-        f"→ {len(bars)} bars ({bars.index[0]} to {bars.index[-1]})"
-    )
+    # ── yfinance fallback ─────────────────────────────────────────────
+    bars = _load_symbol_yfinance(symbol)
     _bar_cache[symbol] = bars
     return bars
 
@@ -363,27 +442,33 @@ def _get_best_signal(pair_name: str | None = None) -> dict:
 
 def _log_startup_screening():
     """Log schema + screening results for all candidate pairs at startup."""
-    # Log schema from one file
-    sample_files = sorted(glob.glob(str(DATA_DIR / "EURUSD_*.parquet")))[:1]
-    if sample_files:
-        sample = pd.read_parquet(
-            sample_files[0], engine="fastparquet", columns=["time", "bid", "ask"]
-        )
-        logger.info(f"Parquet schema columns: {list(sample.columns)}")
-        logger.info(f"  dtypes: {dict(sample.dtypes)}")
+    has_parquet = _has_parquet_data()
+
+    if has_parquet:
+        # Log schema from one file
+        sample_files = sorted(glob.glob(str(DATA_DIR / "EURUSD_*.parquet")))[:1]
+        if sample_files:
+            sample = pd.read_parquet(
+                sample_files[0], engine="fastparquet", columns=["time", "bid", "ask"]
+            )
+            logger.info(f"Parquet schema columns: {list(sample.columns)}")
+            logger.info(f"  dtypes: {dict(sample.dtypes)}")
+
+        # Available symbols
+        all_files = glob.glob(str(DATA_DIR / "*.parquet"))
+        symbols = sorted({Path(f).stem.rsplit("_", 3)[0] for f in all_files})
+        logger.info(f"Available symbols: {symbols}")
+        logger.info(f"Data source: parquet ({DATA_DIR})")
     else:
-        logger.warning(f"No parquet files found in {DATA_DIR}")
-
-    # Available symbols
-    all_files = glob.glob(str(DATA_DIR / "*.parquet"))
-    symbols = sorted({Path(f).stem.rsplit("_", 3)[0] for f in all_files})
-    logger.info(f"Available symbols: {symbols}")
-
-    if "XAUUSD" not in symbols or "XAGUSD" not in symbols:
         logger.warning(
-            "XAUUSD/XAGUSD NOT in dataset — screening "
-            f"{len(WATCHLIST)} curated watchlist pairs"
+            f"No parquet files found in {DATA_DIR} — "
+            "Using yfinance fallback (live 1h OHLCV, 30 days)"
         )
+        logger.info(f"yfinance ticker map: {YF_TICKER_MAP}")
+
+    logger.info(
+        f"Screening {len(WATCHLIST)} curated watchlist pairs"
+    )
 
     # Screen all candidate pairs
     logger.info("── Startup pair screening (30-day window) ──")

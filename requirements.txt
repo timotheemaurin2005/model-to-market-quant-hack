@@ -18,6 +18,7 @@ pydantic>=2.0      # data models (v2 for speed + JSON schema)
 python-dotenv      # load .env
 openai>=1.0        # async OpenAI-compatible client for Doubleword/Nemotron
 httpx              # async HTTP transport for the OpenAI client
+yfinance           # live FX data fallback when parquet is unavailable
 
 # --- Later stages (install when you reach them, not now) ---
 # hftbacktest        # PnL backtest to tune Z thresholds + holding period
