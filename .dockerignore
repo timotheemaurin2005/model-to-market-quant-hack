@@ -1,0 +1,28 @@
+# Large data — mount at runtime via PARQUET_DIR env var
+pricer-output-2026-05-11_2026-06-10/
+
+# Secrets — pass via env vars in deployment
+.env
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Git
+.git/
+.gitignore
+
+# Scratch / output files
+outputs/
+*.csv

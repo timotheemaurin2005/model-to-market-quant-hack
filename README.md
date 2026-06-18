@@ -1,1 +1,0 @@
-# model-to-market-quant-hack

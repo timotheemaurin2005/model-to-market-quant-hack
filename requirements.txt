@@ -1,0 +1,24 @@
+# Current stage: pair_screener.py + kalman_calibration.py + signal_server.py
+pandas
+pyarrow            # parquet reader
+fastparquet        # fallback reader (handles nested-list schemas pyarrow chokes on)
+numpy
+statsmodels        # OLS, ADF/coint
+pykalman           # Kalman EM + filtering
+
+# NOTE: pykalman is lightly maintained and can fail to build against very new
+# numpy. If `pip install pykalman` errors, pin numpy first, e.g.:
+#   pip install "numpy<2.0" pykalman
+# then install the rest.
+
+# --- Signal server (signal_server.py) ---
+fastapi
+uvicorn[standard]  # ASGI server with uvloop + httptools
+pydantic>=2.0      # data models (v2 for speed + JSON schema)
+python-dotenv      # load .env
+openai>=1.0        # async OpenAI-compatible client for Doubleword/Nemotron
+httpx              # async HTTP transport for the OpenAI client
+
+# --- Later stages (install when you reach them, not now) ---
+# hftbacktest        # PnL backtest to tune Z thresholds + holding period
+# PyPortfolioOpt     # portfolio-level correlation-aware sizing
