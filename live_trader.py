@@ -40,8 +40,8 @@ FX_UNIVERSE = ["AUDUSD", "EURCHF", "EURGBP", "EURUSD",
                "GBPUSD", "USDCAD", "USDCHF", "USDJPY"]
 PAIRS = list(itertools.combinations(FX_UNIVERSE, 2))     # 28 candidate pairs
 
-ENTRY_Z = 2.25
-EXIT_Z  = 0.25
+ENTRY_Z = 2.0
+EXIT_Z  = 0.5
 DIVERGENCE_Z = 3.5            # hard stop: frozen |Z| past this => cut (relationship broke)
 MAX_HOLD_HL  = 3.0           # time stop: exit after this many half-lives...
 ABS_MAX_HOLD_MIN = 1440      # ...but never hold longer than one round (1 day)
