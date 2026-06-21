@@ -20,7 +20,7 @@ import MetaTrader5 as mt5
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-DRY_RUN = True            # <-- flip to False ONLY when you intend to place live orders
+DRY_RUN = False            # <-- flip to False ONLY when you intend to place live orders
 
 LOGIN    = 10301
 SERVER   = "3.11.134.149:443"
