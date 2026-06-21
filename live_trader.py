@@ -267,23 +267,7 @@ def tag_of(a, b):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import time
     ex.connect()
-    print("Live loop started. Aligning to 15-min bars. Ctrl+C to stop.")
-    try:
-        while True:
-            # wait until just after the next 15-min boundary
-            now = time.time()
-            sleep_s = 900 - (now % 900) + 5        # +5s so the bar has closed
-            mins = int((900 - (now % 900)) // 60)
-            print(f"...sleeping {sleep_s:.0f}s to next bar (~{mins}m)")
-            time.sleep(sleep_s)
-            try:
-                run_cycle()
-            except Exception as e:
-                print(f"[cycle error] {type(e).__name__}: {e}")  # never let one bad cycle kill the loop
-    except KeyboardInterrupt:
-        print("\nLoop stopped by user.")
-    finally:
-        mt5.shutdown()
-        print(f"DRY_RUN = {ex.DRY_RUN}")
+    run_cycle()        # ONE supervised cycle
+    mt5.shutdown()
+    print(f"\nDRY_RUN = {ex.DRY_RUN}")
