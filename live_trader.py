@@ -31,6 +31,7 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 import MetaTrader5 as mt5
 
+import tempfile
 import mt5_executor as ex   # connect/size/guardrail/place_order + the DRY_RUN switch
 
 # ---------------------------------------------------------------------------
@@ -66,10 +67,27 @@ def load_state():
     return {}
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
 
+def save_state(state):
+    # Write to a temp file in the SAME directory, then atomically replace.
+    # os.replace() is atomic on the same filesystem, so any reader
+    # (pinger.py, claude_analyst.py) sees either the old file or the new
+    # one — never a truncated/half-written one.
+    dir_name = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())   # ensure bytes hit disk before the swap
+        os.replace(tmp_path, STATE_FILE)   # atomic swap
+    except Exception:
+        # clean up the temp file if anything failed before the swap
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 def reconcile(state):
     """Drop pairs whose legs are no longer open at the broker (live only).
