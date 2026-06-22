@@ -2,19 +2,29 @@
 live_trader.py - live pairs mean-reversion loop for Model to Market (hardened).
 
 Runs ON the VPS, in-process. Pulls 15-min bars from MT5, screens cointegration +
-half-life every cycle, and trades the FX pairs that currently qualify. Routes all
+half-life every cycle, and trades the pairs that currently qualify. Routes all
 orders through mt5_executor (DRY_RUN-gated).
 
 HARDENING (vs the first draft):
   * NETTING-SAFE: the account is Netting (one position per symbol). Two held pairs
     that share a symbol would be merged by the broker, breaking per-pair exit.
     So we forbid entering a pair whose symbol is already used by a held pair.
+    (This is what fixes the "two same-direction deals on one symbol" artifact the
+     first draft produced.)
   * FROZEN BASELINE EXIT: on entry we freeze alpha/beta/mu/sigma in state.json and
     judge exits against those, never a re-fit (no "moving goalposts").
   * STATE BY RECORD, NOT COMMENT: holdings live in state.json, reconciled against
     magic-tagged positions by symbol. Broker comment-mangling can't orphan a leg.
   * STOPS: divergence stop (frozen |Z| > 3.5 -> cointegration broken, cut) and
     time stop (held > 3x half-life, capped at one round).
+
+PIVOT CHANGES (this version):
+  * UNIVERSE now includes metals (XAUUSD, XAGUSD). Pairs are formed WITHIN asset
+    class only (no FX-vs-metal cross pairs, which aren't economically cointegrated).
+  * Cointegration test is now Engle-Granger via statsmodels.coint(), which uses the
+    correct MacKinnon critical values. The old adfuller() on OLS residuals was biased
+    toward "stationary" (the regression already minimised residual variance), so it
+    was passing FX pairs that don't actually revert. coint() is stricter and correct.
 
 Workflow: edit on your Mac -> git push -> git pull on the VPS.
 Deps: MetaTrader5, numpy, pandas, statsmodels   (pip install pandas statsmodels)
@@ -28,18 +38,24 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import adfuller, coint
 import MetaTrader5 as mt5
 
 import tempfile
 import mt5_executor as ex   # connect/size/guardrail/place_order + the DRY_RUN switch
+
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 FX_UNIVERSE = ["AUDUSD", "EURCHF", "EURGBP", "EURUSD",
                "GBPUSD", "USDCAD", "USDCHF", "USDJPY"]
-PAIRS = list(itertools.combinations(FX_UNIVERSE, 2))     # 28 candidate pairs
+METALS      = ["XAUUSD", "XAGUSD"]
+UNIVERSE    = FX_UNIVERSE + METALS
+
+# Pair WITHIN asset class only. FX: C(8,2)=28 combos. Metals: 1 combo (gold/silver).
+PAIRS = (list(itertools.combinations(FX_UNIVERSE, 2))
+         + list(itertools.combinations(METALS, 2)))
 
 ENTRY_Z = 1.75
 EXIT_Z  = 0.25
@@ -48,12 +64,12 @@ MAX_HOLD_HL  = 3.0           # time stop: exit after this many half-lives...
 ABS_MAX_HOLD_MIN = 1440      # ...but never hold longer than one round (1 day)
 
 N_BARS  = 3000
-ADF_PMAX = 0.05
+ADF_PMAX = 0.05              # now applied to the Engle-Granger p-value
 HL_MIN_MIN, HL_MAX_MIN = 120, 1440
 BAR_MIN = 15
 
 MARGIN_PER_PAIR      = 15_000
-MAX_CONCURRENT_PAIRS = 9
+MAX_CONCURRENT_PAIRS = 8
 STATE_FILE = "state.json"
 
 
@@ -65,7 +81,6 @@ def load_state():
         with open(STATE_FILE) as f:
             return json.load(f)
     return {}
-
 
 
 def save_state(state):
@@ -88,6 +103,7 @@ def save_state(state):
         except OSError:
             pass
         raise
+
 
 def reconcile(state):
     """Drop pairs whose legs are no longer open at the broker (live only).
@@ -130,7 +146,7 @@ def half_life(spread):
 
 
 def fit_pair(a_close, b_close):
-    df = pd.concat([a_close, b_close], axis=1,sort=False).dropna()
+    df = pd.concat([a_close, b_close], axis=1, sort=False).dropna()
     df.columns = ["a", "b"]
     if len(df) < 500:
         return None
@@ -139,7 +155,12 @@ def fit_pair(a_close, b_close):
     spread = df["a"] - (alpha + beta * df["b"])
     mu, sd = float(spread.mean()), float(spread.std())
     z = float((spread.iloc[-1] - mu) / sd) if sd > 0 else np.nan
-    adf_p = float(adfuller(spread.values, autolag="AIC")[1])
+
+    # Engle-Granger cointegration p-value (correct MacKinnon distribution).
+    # Same regression direction as the OLS above (a on b, with constant), so the
+    # hedge ratio we trade and the relationship we test are consistent.
+    adf_p = float(coint(df["a"].values, df["b"].values, trend="c")[1])
+
     hl_min = half_life(spread) * BAR_MIN
     return dict(alpha=alpha, beta=beta, mu=mu, sd=sd, z=z, adf_p=adf_p, hl_min=hl_min)
 
@@ -202,7 +223,7 @@ def run_cycle():
     print(f"\n=== cycle {now:%Y-%m-%d %H:%M} UTC | holding {len(state)}: "
           f"{sorted(state) or 'none'} ===")
 
-    closes = {s: get_closes(s) for s in FX_UNIVERSE}
+    closes = {s: get_closes(s) for s in UNIVERSE}
 
     # ---- EXIT pass: held pairs, judged on FROZEN baseline ----
     for tag, rec in list(state.items()):
