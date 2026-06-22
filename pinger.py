@@ -64,17 +64,24 @@ def notify(msg: str) -> None:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={"chat_id": TELEGRAM_CHAT_ID, "text": line},
             timeout=10,
         )
+        r.raise_for_status()  # Force exception on 4xx/5xx API responses
     except Exception as e:
-        print(f"[pinger] telegram send failed: {e}", flush=True)
+        response_text = ""
+        try:
+            if 'r' in locals():
+                response_text = f" | Response: {r.text}"
+        except Exception:
+            pass
+        print(f"[pinger] telegram send failed: {e}{response_text}", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# STATE HELPERS
+# STATE HELPENS
 # ---------------------------------------------------------------------------
 def load_state() -> dict | None:
     """
