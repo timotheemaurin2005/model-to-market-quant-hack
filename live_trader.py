@@ -6,28 +6,25 @@ half-life every cycle, and trades the pairs that currently qualify. Routes all
 orders through mt5_executor (DRY_RUN-gated).
 
 HARDENING (vs the first draft):
-  * NETTING-SAFE: the account is Netting (one position per symbol). Two held pairs
-    that share a symbol would be merged by the broker, breaking per-pair exit.
-    So we forbid entering a pair whose symbol is already used by a held pair.
-    (This is what fixes the "two same-direction deals on one symbol" artifact the
-     first draft produced.)
-  * FROZEN BASELINE EXIT: on entry we freeze alpha/beta/mu/sigma in state.json and
-    judge exits against those, never a re-fit (no "moving goalposts").
-  * STATE BY RECORD, NOT COMMENT: holdings live in state.json, reconciled against
-    magic-tagged positions by symbol. Broker comment-mangling can't orphan a leg.
-  * STOPS: divergence stop (frozen |Z| > 3.5 -> cointegration broken, cut) and
-    time stop (held > 3x half-life, capped at one round).
+  * NETTING-SAFE: forbid entering a pair whose symbol is already used by a held pair
+    (this is what fixed the "two same-direction deals on one symbol" artifact).
+  * FROZEN BASELINE EXIT: freeze alpha/beta/mu/sigma on entry; judge exits against
+    those, never a re-fit.
+  * STATE BY RECORD: holdings live in state.json, reconciled by symbol vs magic-tagged
+    positions.
+  * STOPS: divergence stop (frozen |Z| > 3.5) and time stop (held > 3x half-life,
+    capped at one round).
 
-PIVOT CHANGES (this version):
-  * UNIVERSE now includes metals (XAUUSD, XAGUSD). Pairs are formed WITHIN asset
-    class only (no FX-vs-metal cross pairs, which aren't economically cointegrated).
-  * Cointegration test is now Engle-Granger via statsmodels.coint(), which uses the
-    correct MacKinnon critical values. The old adfuller() on OLS residuals was biased
-    toward "stationary" (the regression already minimised residual variance), so it
-    was passing FX pairs that don't actually revert. coint() is stricter and correct.
+PIVOT CHANGES:
+  * Engle-Granger coint() test (correct MacKinnon critical values) replaces the biased
+    adfuller()-on-residuals screen.
+  * UNIVERSE = FX + METALS + CRYPTO. Pairs formed WITHIN asset class only.
+  * fit_pair length floor lowered to 250 (broker M15 history caps ~628 bars).
+  * ENTRY_Z lowered 1.75 -> 1.25: act on qualifying dislocations sooner. This changes
+    the trade TRIGGER only; the screen (which rejects junk) is untouched.
 
-Workflow: edit on your Mac -> git push -> git pull on the VPS.
-Deps: MetaTrader5, numpy, pandas, statsmodels   (pip install pandas statsmodels)
+Workflow: edit on Mac -> git push -> git pull on VPS.
+Deps: MetaTrader5, numpy, pandas, statsmodels
 """
 
 import os
@@ -51,20 +48,22 @@ import mt5_executor as ex   # connect/size/guardrail/place_order + the DRY_RUN s
 FX_UNIVERSE = ["AUDUSD", "EURCHF", "EURGBP", "EURUSD",
                "GBPUSD", "USDCAD", "USDCHF", "USDJPY"]
 METALS      = ["XAUUSD", "XAGUSD"]
-UNIVERSE    = FX_UNIVERSE + METALS
+CRYPTO      = ["BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD"]   # BARUSD excluded: likely wide spread, check before adding
+UNIVERSE    = FX_UNIVERSE + METALS + CRYPTO
 
-# Pair WITHIN asset class only. FX: C(8,2)=28 combos. Metals: 1 combo (gold/silver).
+# Pair WITHIN asset class only. FX: 28 combos, Metals: 1, Crypto: 6 -> 35 candidates.
 PAIRS = (list(itertools.combinations(FX_UNIVERSE, 2))
-         + list(itertools.combinations(METALS, 2)))
+         + list(itertools.combinations(METALS, 2))
+         + list(itertools.combinations(CRYPTO, 2)))
 
-ENTRY_Z = 1.75
+ENTRY_Z = 1.25               # was 1.75 -- act on qualifying dislocations sooner
 EXIT_Z  = 0.25
-DIVERGENCE_Z = 3.5            # hard stop: frozen |Z| past this => cut (relationship broke)
+DIVERGENCE_Z = 3.5           # hard stop: frozen |Z| past this => cut (relationship broke)
 MAX_HOLD_HL  = 3.0           # time stop: exit after this many half-lives...
 ABS_MAX_HOLD_MIN = 1440      # ...but never hold longer than one round (1 day)
 
 N_BARS  = 3000
-ADF_PMAX = 0.05              # now applied to the Engle-Granger p-value
+ADF_PMAX = 0.05              # applied to the Engle-Granger p-value
 HL_MIN_MIN, HL_MAX_MIN = 120, 1440
 BAR_MIN = 15
 
@@ -74,7 +73,7 @@ STATE_FILE = "state.json"
 
 
 # ---------------------------------------------------------------------------
-# STATE  (source of truth for holdings + frozen entry baselines)
+# STATE
 # ---------------------------------------------------------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -84,20 +83,15 @@ def load_state():
 
 
 def save_state(state):
-    # Write to a temp file in the SAME directory, then atomically replace.
-    # os.replace() is atomic on the same filesystem, so any reader
-    # (pinger.py, claude_analyst.py) sees either the old file or the new
-    # one — never a truncated/half-written one.
     dir_name = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(state, f, indent=2)
             f.flush()
-            os.fsync(f.fileno())   # ensure bytes hit disk before the swap
-        os.replace(tmp_path, STATE_FILE)   # atomic swap
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
     except Exception:
-        # clean up the temp file if anything failed before the swap
         try:
             os.remove(tmp_path)
         except OSError:
@@ -106,9 +100,7 @@ def save_state(state):
 
 
 def reconcile(state):
-    """Drop pairs whose legs are no longer open at the broker (live only).
-    In DRY_RUN nothing actually opens, so we trust state.json so exit paths
-    can still be exercised across runs."""
+    """Drop pairs whose legs are no longer open at the broker (live only)."""
     if ex.DRY_RUN:
         return state
     open_syms = {p.symbol for p in (mt5.positions_get() or []) if p.magic == ex.MAGIC}
@@ -148,19 +140,14 @@ def half_life(spread):
 def fit_pair(a_close, b_close):
     df = pd.concat([a_close, b_close], axis=1, sort=False).dropna()
     df.columns = ["a", "b"]
-    if len(df) < 250:
+    if len(df) < 250:        # broker M15 history caps ~628 bars
         return None
     res = sm.OLS(df["a"].values, sm.add_constant(df["b"].values)).fit()
     alpha, beta = float(res.params[0]), float(res.params[1])
     spread = df["a"] - (alpha + beta * df["b"])
     mu, sd = float(spread.mean()), float(spread.std())
     z = float((spread.iloc[-1] - mu) / sd) if sd > 0 else np.nan
-
-    # Engle-Granger cointegration p-value (correct MacKinnon distribution).
-    # Same regression direction as the OLS above (a on b, with constant), so the
-    # hedge ratio we trade and the relationship we test are consistent.
     adf_p = float(coint(df["a"].values, df["b"].values, trend="c")[1])
-
     hl_min = half_life(spread) * BAR_MIN
     return dict(alpha=alpha, beta=beta, mu=mu, sd=sd, z=z, adf_p=adf_p, hl_min=hl_min)
 
@@ -172,14 +159,13 @@ def passes_screen(f):
 
 
 def frozen_z(rec, a_close, b_close):
-    """Z of the current spread against the FROZEN entry baseline."""
     a_now, b_now = float(a_close.iloc[-1]), float(b_close.iloc[-1])
     spread_now = a_now - (rec["alpha"] + rec["beta"] * b_now)
     return (spread_now - rec["mu"]) / rec["sigma"] if rec["sigma"] else float("nan")
 
 
 # ---------------------------------------------------------------------------
-# LEG SIZING (beta-weighted, contract/currency-correct via tick value)
+# LEG SIZING
 # ---------------------------------------------------------------------------
 def price_value_per_lot(symbol):
     info = mt5.symbol_info(symbol)
@@ -207,7 +193,6 @@ def build_legs(a, b, f):
 
 
 def close_pair(tag, rec):
-    """Netting account: an opposite-direction deal of equal volume closes the leg."""
     for p in (mt5.positions_get() or []):
         if p.magic == ex.MAGIC and p.symbol in rec["symbols"]:
             close_dir = -1 if p.type == mt5.POSITION_TYPE_BUY else +1
@@ -225,7 +210,7 @@ def run_cycle():
 
     closes = {s: get_closes(s) for s in UNIVERSE}
 
-    # ---- EXIT pass: held pairs, judged on FROZEN baseline ----
+    # ---- EXIT pass ----
     for tag, rec in list(state.items()):
         a, b = rec["symbols"]
         if closes.get(a) is None or closes.get(b) is None:
@@ -249,7 +234,7 @@ def run_cycle():
             close_pair(tag, rec)
             del state[tag]
 
-    # ---- ENTRY pass: flat pairs, fresh fit + screen ----
+    # ---- ENTRY pass ----
     held_syms = {s for r in state.values() for s in r["symbols"]}
     scan = []
     for a, b in PAIRS:
@@ -311,16 +296,15 @@ if __name__ == "__main__":
     print("Live loop started. Aligning to 15-min bars. Ctrl+C to stop.")
     try:
         while True:
-            # wait until just after the next 15-min boundary
             now = time.time()
-            sleep_s = 900 - (now % 900) + 5        # +5s so the bar has closed
+            sleep_s = 900 - (now % 900) + 5
             mins = int((900 - (now % 900)) // 60)
             print(f"...sleeping {sleep_s:.0f}s to next bar (~{mins}m)")
             time.sleep(sleep_s)
             try:
                 run_cycle()
             except Exception as e:
-                print(f"[cycle error] {type(e).__name__}: {e}")  # never let one bad cycle kill the loop
+                print(f"[cycle error] {type(e).__name__}: {e}")
     except KeyboardInterrupt:
         print("\nLoop stopped by user.")
     finally:
