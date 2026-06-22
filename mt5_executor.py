@@ -1,17 +1,20 @@
 """
-mt5_executor.py — sizing + guardrail + (dry-run) execution for Model to Market.
+mt5_executor.py — sizing + guardrail + execution for Model to Market.
 
-Runs ON the VPS, in-process with the signal loop. No HTTP, no public port.
-The signal loop imports this and calls size_position() / check_guardrails() / place_order().
+Shared by BOTH books:
+  - live_trader.py        (FX mean-reversion core — your survival/rank engine)
+  - directional_trader.py (Donchian breakout sleeve — your return engine)
 
-SAFETY
-------
-- DRY_RUN defaults True. Nothing is sent to the broker until you set it False.
-- Sizing and risk use the broker's own calculators (order_calc_margin). Currency
-  conversion for USD/JPY/CHF/cross pairs is therefore correct, never hand-rolled.
-- Credentials come from the environment, never the repo:
-      set MT5_PASSWORD via Windows System Properties -> Environment Variables
-      (use the GUI so the " in the password needs no shell escaping).
+KEY SAFETY DESIGN
+-----------------
+- Module-level DRY_RUN is the DEFAULT for any call that doesn't override it.
+- place_order() now takes a per-call `dry_run` override. This lets the FX core
+  run LIVE (ex.DRY_RUN=False) while the directional book is independently
+  dry-run-tested (passes dry_run=True) on the SAME account. Without this, the
+  two books would be forced to share one live/dry state — a footgun.
+- Sizing/risk use the broker's own calculator (order_calc_margin), so currency
+  conversion is correct, never hand-rolled.
+- Credentials come from the environment (MT5_PASSWORD), never the repo.
 """
 
 import os
@@ -20,20 +23,17 @@ import MetaTrader5 as mt5
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-DRY_RUN = False            # <-- flip to False ONLY when you intend to place live orders
+DRY_RUN = False            # FX core default. Live for Round 2. Per-call override exists.
 
 LOGIN    = 10301
 SERVER   = "3.11.134.149:443"
-PASSWORD = os.environ.get("MT5_PASSWORD")   # set on the VPS, not in the repo
+PASSWORD = os.environ.get("MT5_PASSWORD")
 
-# Guardrail caps — sit deliberately below competition penalty cliffs / stop-out.
-# Competition: margin-usage penalty >90%, leverage penalty >28x, force-liquidation
-# at 30% margin LEVEL (= instant elimination).
-MAX_MARGIN_USAGE = 0.85   # used_margin / equity  (also ~= 25x leverage on 30x pairs)
-MAX_SINGLE_INSTR = 0.80   # one instrument's margin / total used margin
-STOPOUT_LEVEL    = 0.30   # broker force-liquidation threshold (margin level)
+MAX_MARGIN_USAGE = 0.85
+MAX_SINGLE_INSTR = 0.80
+STOPOUT_LEVEL    = 0.30
 
-MAGIC = 20260621          # tag so we can identify our own orders
+MAGIC = 20260621           # FX-core order tag
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,6 @@ def connect():
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
     term = mt5.terminal_info()
     if term is None or not term.trade_allowed:
-        # initialize() can flip the terminal's Algo Trading off; surface it loudly.
         raise RuntimeError("Algo Trading is DISABLED in the terminal (press Ctrl+E). "
                            "Orders would be silently rejected. Enable it and re-run.")
     acc = mt5.account_info()
@@ -56,7 +55,7 @@ def connect():
 
 
 # ---------------------------------------------------------------------------
-# SIZING  (margin-budget based, using the broker's calculator)
+# SIZING
 # ---------------------------------------------------------------------------
 def _round_to_step(lots, step):
     return round(round(lots / step) * step, 8)
@@ -70,7 +69,6 @@ def _price(symbol, direction):
 
 
 def margin_for(symbol, lots, direction):
-    """USD margin the broker would require for `lots` of `symbol`."""
     price = _price(symbol, direction)
     if price is None:
         return None
@@ -79,10 +77,7 @@ def margin_for(symbol, lots, direction):
 
 
 def size_by_margin(symbol, margin_budget_usd, direction):
-    """Lots that use ~margin_budget_usd of margin. Clamped to broker min/step/max.
-
-    Returns (lots, est_margin) or (None, None) if the symbol isn't tradable.
-    """
+    """Lots that use ~margin_budget_usd of margin. Clamped to broker min/step/max."""
     info = mt5.symbol_info(symbol)
     if info is None:
         return None, None
@@ -97,14 +92,11 @@ def size_by_margin(symbol, margin_budget_usd, direction):
 
 
 # ---------------------------------------------------------------------------
-# GUARDRAIL  (one-way gate: reject or accept; never resizes up)
+# GUARDRAIL  (aggregate book: existing positions + proposed legs)
 # ---------------------------------------------------------------------------
 def check_guardrails(proposed):
-    """proposed = list of (symbol, lots, direction).
-
-    Returns (ok: bool, reason: str, stats: dict). Evaluates the AGGREGATE book
-    (existing positions + proposed), which is what actually drives the stop-out.
-    """
+    """proposed = list of (symbol, lots, direction). Evaluates the WHOLE account
+    (FX core + directional + proposed), since margin/stop-out are account-wide."""
     acc = mt5.account_info()
     equity = acc.equity
     existing_margin = acc.margin
@@ -120,12 +112,9 @@ def check_guardrails(proposed):
     if total_margin <= 0:
         return True, "no margin used", {"total_margin": 0.0}
 
-    margin_usage = total_margin / equity            # competition penalty metric
-    margin_level = equity / total_margin            # stop-out at 0.30
+    margin_usage = total_margin / equity
+    margin_level = equity / total_margin
     max_instr_frac = (max(per_instr.values()) / total_margin) if per_instr else 0.0
-
-    # How far can equity fall before the 30% stop-out, expressed as a % of equity.
-    # stop-out when equity == 0.30 * total_margin  ->  cushion below.
     stopout_equity = STOPOUT_LEVEL * total_margin
     cushion_frac = (equity - stopout_equity) / equity if equity else 0.0
 
@@ -141,21 +130,26 @@ def check_guardrails(proposed):
 
 
 # ---------------------------------------------------------------------------
-# ORDER PLACEMENT  (gated by DRY_RUN)
+# ORDER PLACEMENT  (per-call dry_run override)
 # ---------------------------------------------------------------------------
 def _filling_mode(symbol):
-    """Pick a filling mode the symbol actually supports (IOC preferred, else FOK)."""
     info = mt5.symbol_info(symbol)
     mode = info.filling_mode if info else 0
-    if mode & 2:   # SYMBOL_FILLING_IOC
+    if mode & 2:
         return mt5.ORDER_FILLING_IOC
-    if mode & 1:   # SYMBOL_FILLING_FOK
+    if mode & 1:
         return mt5.ORDER_FILLING_FOK
     return mt5.ORDER_FILLING_RETURN
 
 
-def place_order(symbol, lots, direction, comment="m2m"):
-    """Market order. In DRY_RUN it only logs the request and sends nothing."""
+def place_order(symbol, lots, direction, comment="m2m", magic=MAGIC, dry_run=None):
+    """Market order.
+
+    dry_run: None -> use module DRY_RUN. True/False -> override for THIS call.
+    This is what lets the FX core run live while the directional book dry-runs.
+    """
+    effective_dry = DRY_RUN if dry_run is None else dry_run
+
     price = _price(symbol, direction)
     if price is None:
         print(f"[SKIP] {symbol}: no price"); return None
@@ -167,52 +161,16 @@ def place_order(symbol, lots, direction, comment="m2m"):
         "type": otype,
         "price": price,
         "deviation": 20,
-        "magic": MAGIC,
+        "magic": magic,
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": _filling_mode(symbol),
     }
     side = "BUY" if direction > 0 else "SELL"
-    if DRY_RUN:
-        print(f"[DRY-RUN] would send {side} {lots} {symbol} @ {price}")
+    if effective_dry:
+        print(f"[DRY-RUN] would send {side} {lots} {symbol} @ {price} (magic={magic})")
         return {"dry_run": True, "request": req}
     result = mt5.order_send(req)
-    ok = result and result.retcode == mt5.TRADE_RETCODE_DONE
     print(f"[LIVE] {side} {lots} {symbol}: retcode={getattr(result,'retcode',None)} "
           f"{getattr(result,'comment','')}")
     return result
-
-
-# ---------------------------------------------------------------------------
-# DEMO  — read-only walk-through of the full pipeline (safe; nothing is sent)
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    connect()
-
-    # Sample pair trade: long EURUSD / short USDJPY, ~$15k margin per leg.
-    MARGIN_PER_LEG = 15_000
-    legs = [("EURUSD", +1), ("USDJPY", -1)]
-
-    proposed = []
-    print("\n--- sizing ---")
-    for sym, d in legs:
-        lots, est_m = size_by_margin(sym, MARGIN_PER_LEG, d)
-        if lots is None:
-            print(f"{sym}: not tradable"); continue
-        print(f"{sym:8} {'LONG' if d>0 else 'SHORT':5} {lots} lots  est margin ${est_m:,.0f}")
-        proposed.append((sym, lots, d))
-
-    print("\n--- guardrail (aggregate book) ---")
-    ok, reason, stats = check_guardrails(proposed)
-    for k, v in stats.items():
-        print(f"  {k:20} {v:,.4f}" if isinstance(v, float) else f"  {k:20} {v}")
-    print(f"  -> {'PASS' if ok else 'REJECT'}: {reason}")
-
-    if ok:
-        print("\n--- placement (DRY-RUN) ---")
-        for sym, lots, d in proposed:
-            place_order(sym, lots, d, comment="demo")
-
-    mt5.shutdown()
-    print(f"\nDRY_RUN = {DRY_RUN}  (no orders were sent)" if DRY_RUN
-          else "\nLIVE MODE — orders above were real.")
