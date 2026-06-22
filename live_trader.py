@@ -148,7 +148,7 @@ def half_life(spread):
 def fit_pair(a_close, b_close):
     df = pd.concat([a_close, b_close], axis=1, sort=False).dropna()
     df.columns = ["a", "b"]
-    if len(df) < 500:
+    if len(df) < 250:
         return None
     res = sm.OLS(df["a"].values, sm.add_constant(df["b"].values)).fit()
     alpha, beta = float(res.params[0]), float(res.params[1])
