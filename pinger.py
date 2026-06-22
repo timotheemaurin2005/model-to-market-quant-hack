@@ -3,8 +3,8 @@
 pinger.py  —  Mechanical Event Monitor (Channel 1)
 
 Out-of-band watchdog for the Dual-Brain FX stat-arb system. Runs ALONGSIDE the
-execution loop (never inside it). It diffs state.json between polls and checks
-live margin, then sends a Telegram alert ONLY when something mechanical and
+execution loop (never inside it). It diffs state.json (or trade_state.json) between polls
+and checks live margin, then sends a Telegram alert ONLY when something mechanical and
 pre-decided changes. It never makes or suggests trading decisions — it reports
 facts that map to a rule you already set.
 
@@ -39,7 +39,12 @@ import mt5_executor as ex
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-STATE_FILE          = "state.json"
+# Automatically detect if live_trader uses trade_state.json or state.json
+if os.path.exists("trade_state.json"):
+    STATE_FILE = "trade_state.json"
+else:
+    STATE_FILE = "state.json"
+
 POLL_SECONDS        = 60                 # gentle; state changes on 15-min bars anyway
 MARGIN_WARN         = 0.70               # margin usage fraction to alert on
 GBP_TRIPWIRE_PAIR   = "EURGBP/USDCAD"    # 2nd exit of this => exclude-GBP rule fires
@@ -71,7 +76,11 @@ def notify(msg: str) -> None:
 # ---------------------------------------------------------------------------
 # STATE HELPERS
 # ---------------------------------------------------------------------------
-def load_state() -> dict:
+def load_state() -> dict | None:
+    """
+    Loads state data. Returns None if there's a file read or JSON parse error.
+    This prevents false exit/entry triggers during mid-write race conditions.
+    """
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -79,7 +88,7 @@ def load_state() -> dict:
             txt = f.read().strip()
         return json.loads(txt) if txt else {}
     except Exception:
-        return {}            # mid-write race: skip this poll, try again next time
+        return None            # Return None to signal a mid-write race condition
 
 
 def margin_usage() -> float:
@@ -94,15 +103,27 @@ def margin_usage() -> float:
 # ---------------------------------------------------------------------------
 def main() -> None:
     ex.connect()   # raises if MT5 / Algo Trading not ready; read-only use here
-    notify("pinger online — watching state.json + margin (read-only).")
+    notify(f"pinger online — watching {STATE_FILE} + margin (read-only).")
 
-    prev = set(load_state().keys())
+    initial_state = load_state()
+    # If initial load fails because of race, retry until successful setup
+    while initial_state is None:
+        time.sleep(1)
+        initial_state = load_state()
+
+    prev = set(initial_state.keys())
     gbp_exit_count = 0
     margin_alerted = False     # latch so we don't spam every poll over 70%
 
     while True:
         try:
-            cur = set(load_state().keys())
+            state_data = load_state()
+            if state_data is None:
+                # Mid-write collision detected. Skip this check to prevent false notifications.
+                time.sleep(1)
+                continue
+
+            cur = set(state_data.keys())
 
             # --- exits: pairs that were held last poll and are now gone ----
             for tag in prev - cur:
