@@ -13,7 +13,7 @@ HARD_STOP_PRICE = 66.2        # Adjusted based on June 22 chart peak
 KILL_SWITCH_USD = -110000.0   # Hard liquidation line
 MAGIC_SILVER = 20260703
 STATE_FILE = "silver_state.json"
-PMI_TIME_CEST = datetime(2026, 6, 23, 15, 45, tzinfo=timezone.utc) # 15:45 CEST
+PMI_TIME_UTC = datetime(2026, 6, 23, 13, 45, tzinfo=timezone.utc) # 13:45 UTC is 15:45 CEST
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -108,7 +108,7 @@ def run_silver_sleeve():
     elif state["tranches_open"] == 1:
         now = datetime.now(timezone.utc)
         # Check if PMI has passed AND price is lower than Tranche 1 (Trend confirmed)
-        if now > PMI_TIME_CEST and current_price < state["last_entry_price"]:
+        if now > PMI_TIME_UTC and current_price < state["last_entry_price"]:
             if not check_combined_margin(equity): return
             
             vol = get_tranche_volume(equity, current_price)
