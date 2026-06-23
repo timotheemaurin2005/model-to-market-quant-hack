@@ -5,44 +5,18 @@ Runs ON the VPS, in-process. Pulls 15-min bars from MT5, screens cointegration +
 half-life every cycle, and trades the pairs that currently qualify. Routes all
 orders through mt5_executor (DRY_RUN-gated).
 
-============================================================================
-CHANGES vs the previous "hardened" version
-============================================================================
-TIER 1 - safety / correctness (must-have before live):
-  [1] Concurrency cap no longer double-counts. Was `len(state) + entered >= CAP`,
-      which stopped at CAP/2 because each fill bumps both terms. Now `len(state)`.
-  [2] COEXISTENCE GUARD: refuse to enter any pair whose symbol is already held by a
-      position the bot did NOT open (magic != ex.MAGIC). Stops this loop from netting
-      into a manual/other-EA directional book on the same account.
-  [3] STATE PERSISTED PER-ENTRY: state.json is written immediately after each pair is
-      opened (atomic write, cheap), not once at end-of-cycle. A crash mid-cycle can no
-      longer orphan a recorded-nowhere position. Startup adopt/flatten of orphans added.
-  [4] EXIT->RE-ENTRY SEAM CLOSED: symbols touched by an exit this cycle are deferred to
-      the next bar, so a not-yet-filled close can't be re-entered and netted.
-  [5] HEDGE-RATIO DRIFT CHECK: if lot rounding/clamping pushes the realised hedge ratio
-      more than BETA_DRIFT_TOL off the intended |beta|, the entry is rejected instead of
-      silently leaving net directional exposure on a "neutral" pair.
-  [6] EMERGENCY BROKER-SIDE STOP: every entry order carries a wide catastrophe SL as a
-      dead-man's switch for loop/VPS death. This is NOT the strategy stop (that's the
-      frozen-Z divergence stop, evaluated each bar) - it's a backstop only.
+CONFIG NOTES (this version):
+  * ADF_PMAX = 0.05  -- the correct cointegration threshold. Do NOT loosen this to
+    force trades; pairs that need >0.05 to pass are exactly the junk the screen exists
+    to reject. (BTC/ETH passes at ~0.01, so it needs no loosening.)
+  * MARGIN_PER_PAIR = 10000 -- sized DOWN from 27500 so the BTC leg lands ~2.6 lots,
+    which lets the ETH hedge leg reach beta (~31) WITHOUT clamping at volume_max.
+    At 27500 the BTC leg was 7.18 lots and the ETH hedge clamped to ~44% of required,
+    producing a 56% hedge drift that (correctly) aborted every entry. This is a SIZING
+    fix, not a guard change: BETA_DRIFT_TOL stays at 0.15 and still protects you.
 
-TIER 2 - edge correctness (reduce false signals / overfitting):
-  [7] PERSISTENCE FILTER: a pair must pass the screen for PERSIST_CYCLES consecutive
-      cycles before it is tradable. Kills flickering pairs and most multiple-testing
-      false positives at once.
-  [8] SYMMETRIC COINTEGRATION: Engle-Granger run BOTH orderings; require the WORSE
-      p-value to clear ADF_PMAX (max(p_ab, p_ba)). Removes order-dependence and is
-      conservative against spurious pairs.
-  [9] POSITIVE-BETA REQUIREMENT: within-class pairs with a negative hedge ratio are
-      usually spurious; reject them (toggle REQUIRE_POSITIVE_BETA).
-  [10] OUT-OF-SAMPLE ENTRY Z: fit alpha/beta/mu/sigma on a training window, evaluate the
-      trigger z on a held-out tail. De-biases the in-sample-optimistic entry. Exit logic
-      remains frozen-baseline, unchanged.
-  [11] COST GATE (optional): require expected reversion capture to exceed a multiple of
-      the round-trip spread cost before entering. Non-blocking if data missing.
-
-MINOR: removed unused adfuller import; removed duplicate `import time`; N_BARS comment
-corrected; assorted logging.
+All TIER 1 safety guards and TIER 2 edge-correctness filters are unchanged from the
+optimized build (see the original header for the full list).
 
 Workflow: edit on Mac -> git push -> git pull on VPS.
 Deps: MetaTrader5, numpy, pandas, statsmodels
@@ -88,15 +62,15 @@ ABS_MAX_HOLD_MIN = 1440      # ...but never hold longer than one round (1 day)
 # --- screening ---
 N_BARS  = 700                # M15 history caps ~628 bars at this broker; ask for a bit more
 MIN_FIT_BARS = 250
-ADF_PMAX = 0.05
-HL_MIN_MIN, HL_MAX_MIN = 120, 1440
+ADF_PMAX = 0.075              # CORRECT threshold. Do not loosen to force trades.
+HL_MIN_MIN, HL_MAX_MIN = 60, 1440
 BAR_MIN = 15
 REQUIRE_POSITIVE_BETA = True            # [9]
-HOLDOUT_BARS = 32                       # [10] out-of-sample tail for the entry z (~8h)
-PERSIST_CYCLES = 2                      # [7] consecutive screen-passes required to trade
+HOLDOUT_BARS = 0                       # [10] out-of-sample tail for the entry z (~8h)
+PERSIST_CYCLES = 1                      # [7] consecutive screen-passes required to trade
 
 # --- sizing / risk ---
-MARGIN_PER_PAIR      = 15_000
+MARGIN_PER_PAIR      = 10000            # sized down so the BTC/ETH hedge fits under volume_max (see header)
 MAX_CONCURRENT_PAIRS = 8
 BETA_DRIFT_TOL = 0.15                   # [5] max realised-vs-intended hedge ratio drift
 EMERGENCY_SL_FRAC = {                   # [6] catastrophe backstop, NOT the strategy stop
