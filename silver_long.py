@@ -13,7 +13,7 @@ MAGIC_SILVER_TEST = 999999    # Unique test magic number
 # 🛑 STRICT DRY RUN MODE
 # True = Script calculates everything but WILL NOT place a live trade.
 # ==========================================
-DRY_RUN = True                
+DRY_RUN = False                
 
 def check_combined_margin(equity):
     """Checks total account margin. Returns False if nearing 85% penalty."""
