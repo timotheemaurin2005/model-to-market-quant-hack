@@ -4,16 +4,16 @@ import time
 from datetime import datetime, timezone
 
 SYMBOL = "XAGUSD"
-DIRECTION = -1                # Short
+DIRECTION = 1                 # Long
 TOTAL_RISK_PCT = 0.04         # 4% equity risk
-HARD_STOP_PRICE = 66.20       # Adjusted based on June 22 chart peak
+HARD_STOP_PRICE = 61.80       # Adjusted BELOW current price for a Long
 MAGIC_SILVER_TEST = 999999    # Unique test magic number
 
 # ==========================================
 # 🛑 STRICT DRY RUN MODE
 # True = Script calculates everything but WILL NOT place a live trade.
 # ==========================================
-DRY_RUN = False                
+DRY_RUN = True                
 
 def check_combined_margin(equity):
     """Checks total account margin. Returns False if nearing 85% penalty."""
@@ -61,7 +61,7 @@ def run_silver_test():
         print(f"❌ Failed to get live tick for {SYMBOL}")
         return
         
-    current_price = tick.bid
+    current_price = tick.ask  # BUY orders execute at the ASK price
     print(f"📊 Live {SYMBOL} Price: {current_price}")
     
     if not check_combined_margin(equity): 
@@ -70,7 +70,7 @@ def run_silver_test():
     vol = get_test_volume(equity, current_price)
     
     print("\n--- TEST EXECUTION CALCULATION ---")
-    print(f"Target Action:  SELL (Short)")
+    print(f"Target Action:  BUY (Long)")
     print(f"Target Volume:  {vol} lots")
     print(f"Entry Price:    {current_price}")
     print(f"Hard Stop:      {HARD_STOP_PRICE}")
@@ -85,7 +85,7 @@ def run_silver_test():
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": SYMBOL,
             "volume": vol,
-            "type": mt5.ORDER_TYPE_SELL,
+            "type": mt5.ORDER_TYPE_BUY,
             "price": current_price,
             "sl": HARD_STOP_PRICE,
             "deviation": 20,
