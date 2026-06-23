@@ -70,7 +70,7 @@ HOLDOUT_BARS = 0                       # [10] out-of-sample tail for the entry z
 PERSIST_CYCLES = 1                      # [7] consecutive screen-passes required to trade
 
 # --- sizing / risk ---
-MARGIN_PER_PAIR      = 10000            # sized down so the BTC/ETH hedge fits under volume_max (see header)
+MARGIN_PER_PAIR      = 6000            # sized down so the BTC/ETH hedge fits under volume_max (see header)
 MAX_CONCURRENT_PAIRS = 8
 BETA_DRIFT_TOL = 0.15                   # [5] max realised-vs-intended hedge ratio drift
 EMERGENCY_SL_FRAC = {                   # [6] catastrophe backstop, NOT the strategy stop
