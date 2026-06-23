@@ -174,7 +174,7 @@ def reconcile(state):
     """Drop pairs whose legs are no longer open at the broker (live only)."""
     if ex.DRY_RUN:
         return state
-    open_syms = {p.symbol for p in (mt5.positions_get() or []) if p.magic == ex.MAGIC}
+    open_syms = {p.symbol for p in (mt5.positions_get() or []) if p.magic == ex.MAGIC_FX}
     alive = {}
     for tag, rec in state.items():
         # [6/strict] require *all* legs still open; a one-legged pair is a naked
@@ -193,9 +193,9 @@ def reconcile(state):
 
 def _flatten_symbols(symbols, comment="flatten"):
     for p in (mt5.positions_get() or []):
-        if p.magic == ex.MAGIC and p.symbol in symbols:
+        if p.magic == ex.MAGIC_FX and p.symbol in symbols:
             close_dir = -1 if p.type == mt5.POSITION_TYPE_BUY else +1
-            ex.place_order(p.symbol, p.volume, close_dir, comment=comment)
+            ex.place_order(p.symbol, p.volume, close_dir, comment=comment, magic=ex.MAGIC_FX)
 
 
 def handle_orphans_on_startup(state):
@@ -206,7 +206,7 @@ def handle_orphans_on_startup(state):
         return
     recorded = {s for rec in state.values() for s in rec["symbols"]}
     orphan_syms = {p.symbol for p in (mt5.positions_get() or [])
-                   if p.magic == ex.MAGIC and p.symbol not in recorded}
+                   if p.magic == ex.MAGIC_FX and p.symbol not in recorded}
     if not orphan_syms:
         return
     print(f"!! ORPHANS (bot-magic, not in state): {sorted(orphan_syms)}")
@@ -379,26 +379,27 @@ def cost_gate_ok(legs, f):
 
 
 def place_pair(legs, tag):
-    """Place both legs with an emergency SL on each [6].
-    NOTE: requires mt5_executor.place_order to accept an `sl=` price kwarg and apply it.
-    If your executor doesn't, either add it there or attach via mt5.order_send modify."""
+    """Place both legs with an emergency SL on each [6], tagged with the FX-core magic.
+    Requires mt5_executor.place_order to accept `sl=` and `magic=` kwargs (it now does)."""
     for s, l, d in legs:
         sl = emergency_sl_price(s, d)
-        ex.place_order(s, l, d, comment=tag, sl=sl)
+        ex.place_order(s, l, d, comment=tag, magic=ex.MAGIC_FX, sl=sl)
 
 
 def close_pair(tag, rec):
     for p in (mt5.positions_get() or []):
-        if p.magic == ex.MAGIC and p.symbol in rec["symbols"]:
+        if p.magic == ex.MAGIC_FX and p.symbol in rec["symbols"]:
             close_dir = -1 if p.type == mt5.POSITION_TYPE_BUY else +1
-            ex.place_order(p.symbol, p.volume, close_dir, comment=tag + "-exit")
+            ex.place_order(p.symbol, p.volume, close_dir, comment=tag + "-exit", magic=ex.MAGIC_FX)
 
 
 def externally_held_syms():
-    """[2] symbols with an open position this bot did NOT open."""
+    """[2] symbols with an open position this bot did NOT open — i.e. anything whose
+    magic is not the FX core's. This INCLUDES the directional sleeve (MAGIC_DIR) and
+    any manual position, so the FX core will refuse to trade on top of them."""
     if ex.DRY_RUN:
         return set()
-    return {p.symbol for p in (mt5.positions_get() or []) if p.magic != ex.MAGIC}
+    return {p.symbol for p in (mt5.positions_get() or []) if p.magic != ex.MAGIC_FX}
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +521,7 @@ def tag_of(a, b):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     ex.connect()
-    print(f"Live loop started. DRY_RUN={ex.DRY_RUN} MAGIC={getattr(ex, 'MAGIC', '??')}")
+    print(f"Live loop started. DRY_RUN={ex.DRY_RUN} MAGIC_FX={getattr(ex, 'MAGIC_FX', '??')}")
     handle_orphans_on_startup(load_state())      # [3]
     print("Aligning to 15-min bars. Ctrl+C to stop.")
     try:

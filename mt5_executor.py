@@ -8,13 +8,23 @@ Shared by BOTH books:
 KEY SAFETY DESIGN
 -----------------
 - Module-level DRY_RUN is the DEFAULT for any call that doesn't override it.
-- place_order() now takes a per-call `dry_run` override. This lets the FX core
+- place_order() takes a per-call `dry_run` override. This lets the FX core
   run LIVE (ex.DRY_RUN=False) while the directional book is independently
-  dry-run-tested (passes dry_run=True) on the SAME account. Without this, the
-  two books would be forced to share one live/dry state — a footgun.
+  dry-run-tested (passes dry_run=True) on the SAME account.
 - Sizing/risk use the broker's own calculator (order_calc_margin), so currency
   conversion is correct, never hand-rolled.
 - Credentials come from the environment (MT5_PASSWORD), never the repo.
+
+CHANGE (magic split + SL):
+- MAGIC is no longer one shared tag. Each sleeve has its own so they can be told
+  apart on a shared account:
+      MAGIC_DIR = directional sleeve  (== the existing/legacy live positions)
+      MAGIC_FX  = FX mean-reversion core (new, unique)
+  `MAGIC` is kept as a backward-compat alias == MAGIC_DIR so directional_trader.py
+  (which relied on the old default) is unchanged. place_order() now defaults to
+  MAGIC_DIR; live_trader.py passes magic=MAGIC_FX explicitly.
+- place_order() now accepts an optional `sl=` price and attaches it to the deal,
+  so the FX core can set a broker-side emergency stop on every leg.
 """
 
 import os
@@ -33,7 +43,10 @@ MAX_MARGIN_USAGE = 0.85
 MAX_SINGLE_INSTR = 0.80
 STOPOUT_LEVEL    = 0.30
 
-MAGIC = 20260621           # FX-core order tag
+# --- order tags, one per sleeve so a shared account stays distinguishable ---
+MAGIC_DIR = 20260621       # directional (Donchian) sleeve — ALSO the existing live positions
+MAGIC_FX  = 20260631       # FX mean-reversion core (new, unique)
+MAGIC     = MAGIC_DIR      # backward-compat alias for any code importing MAGIC
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +143,7 @@ def check_guardrails(proposed):
 
 
 # ---------------------------------------------------------------------------
-# ORDER PLACEMENT  (per-call dry_run override)
+# ORDER PLACEMENT  (per-call dry_run override + optional broker-side SL)
 # ---------------------------------------------------------------------------
 def _filling_mode(symbol):
     info = mt5.symbol_info(symbol)
@@ -142,11 +155,15 @@ def _filling_mode(symbol):
     return mt5.ORDER_FILLING_RETURN
 
 
-def place_order(symbol, lots, direction, comment="m2m", magic=MAGIC, dry_run=None):
+def place_order(symbol, lots, direction, comment="m2m", magic=MAGIC_DIR,
+                sl=None, dry_run=None):
     """Market order.
 
+    magic:   defaults to MAGIC_DIR (directional sleeve / legacy). The FX core
+             passes magic=MAGIC_FX so the two books stay distinguishable.
+    sl:      optional stop-loss PRICE. Attached to the deal if provided. Used by
+             the FX core as a wide emergency backstop on every leg.
     dry_run: None -> use module DRY_RUN. True/False -> override for THIS call.
-    This is what lets the FX core run live while the directional book dry-runs.
     """
     effective_dry = DRY_RUN if dry_run is None else dry_run
 
@@ -166,11 +183,15 @@ def place_order(symbol, lots, direction, comment="m2m", magic=MAGIC, dry_run=Non
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": _filling_mode(symbol),
     }
+    if sl is not None:
+        req["sl"] = float(sl)
+
     side = "BUY" if direction > 0 else "SELL"
+    sl_txt = f" sl={sl}" if sl is not None else ""
     if effective_dry:
-        print(f"[DRY-RUN] would send {side} {lots} {symbol} @ {price} (magic={magic})")
+        print(f"[DRY-RUN] would send {side} {lots} {symbol} @ {price}{sl_txt} (magic={magic})")
         return {"dry_run": True, "request": req}
     result = mt5.order_send(req)
-    print(f"[LIVE] {side} {lots} {symbol}: retcode={getattr(result,'retcode',None)} "
+    print(f"[LIVE] {side} {lots} {symbol}{sl_txt}: retcode={getattr(result,'retcode',None)} "
           f"{getattr(result,'comment','')}")
     return result
