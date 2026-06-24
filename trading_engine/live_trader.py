@@ -62,11 +62,11 @@ ABS_MAX_HOLD_MIN = 1440      # ...but never hold longer than one round (1 day)
 # --- screening ---
 N_BARS  = 700                # M15 history caps ~628 bars at this broker; ask for a bit more
 MIN_FIT_BARS = 250
-ADF_PMAX = 0.075              # CORRECT threshold. Do not loosen to force trades.
-HL_MIN_MIN, HL_MAX_MIN = 60, 1440
+ADF_PMAX = 0.065              # CORRECT threshold. Do not loosen to force trades.
+HL_MIN_MIN, HL_MAX_MIN = 120, 1440
 BAR_MIN = 15
 REQUIRE_POSITIVE_BETA = True            # [9]
-HOLDOUT_BARS = 0                       # [10] out-of-sample tail for the entry z (~8h)
+HOLDOUT_BARS = 32                       # [10] out-of-sample tail for the entry z (~8h)
 PERSIST_CYCLES = 1                      # [7] consecutive screen-passes required to trade
 
 # --- sizing / risk ---
