@@ -23,3 +23,4 @@ yfinance           # live FX data fallback when parquet is unavailable
 # --- Later stages (install when you reach them, not now) ---
 # hftbacktest        # PnL backtest to tune Z thresholds + holding period
 # PyPortfolioOpt     # portfolio-level correlation-aware sizing
+google-antigravity # agent chat room
