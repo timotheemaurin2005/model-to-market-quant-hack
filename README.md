@@ -2,36 +2,27 @@
 
 A market-neutral pairs-trading engine based on research into **asymmetric conformal prediction**, paired with a powerful **Multi-Agent Orchestrator** for macro risk analysis and trade evaluation.
 
-## Overview
+## Project Description — why it's AI-native and innovative
 
-Most pairs-trading systems size entries off a single static Z-score (e.g., enter at |Z| > 2, exit at |Z| < 0.5), assuming the spread behaves symmetrically. However, real cointegrated spreads are **not symmetric** — a spread that reverts cleanly when it's wide to the upside can behave completely differently to the downside due to regime shifts, skewed liquidity, and asymmetric carry. 
+Most AI trading systems fail the same way: they put a slow, non-deterministic LLM directly in the execution path, where one bad call triggers a fatal drawdown. This system air-gaps the two — deterministic execution, AI reasoning — with a human on the boundary.
 
-This project explores a more robust approach:
-1. **Statistical Execution Core:** Trades the statistical relationship between correlated instruments (e.g. GBPUSD/USDJPY) using a two-piece modal split-conformal predictor to fit separate, calibrated confidence bands for each side of the spread.
-2. **Multi-Agent Advisory Layer:** A deterministic execution loop paired with a team of AI subagents that summarize live market data, debate trading theses, and calculate position risk.
+**Statistical core (deterministic, zero LLM).** Pairs-trading mean reversion that never calls a language model. It drops the field-standard symmetric Z-score for a custom **Asymmetric Conformal Predictor** — separate calibrated bands per side of the spread, validated out-of-sample, with any failing pair gated out before it trades. An EM-calibrated **Kalman filter** sets the hedge ratio dynamically, so risk is priced off the data, not a textbook threshold — and the band doubles as drawdown control.
+
+**Multi-agent orchestrator (AI-native, advisory-only).** A multi-model debate (Claude Agent SDK + Gemini) where five subagents pressure-test every idea: a **Summariser** pulls live prices, an **Ingestor** builds the case, a **Contradictor** attacks it, a **Quant** reads the live book for exact sizing, and a **Judge** issues a Go/No-Go.
+
+**The key idea: the agents recommend, but cannot trade.** There is no automated write-path from the AI layer to execution — a human is the only route to the order book. That's what makes it AI-native without being AI-fragile: the reasoning layer can be as aggressive as it likes, because a deterministic core and a human gate stand between it and real risk. Running two model families on opposing sides is deliberate — it stops one model's blind spot from waving a bad trade through.
 
 ---
 
-## 1. Asymmetric Conformal Prediction
-*(See [`trading_engine/conformal.py`](trading_engine/conformal.py))*
+## Technology Stack Used
 
-This repo implements **Algorithm 1 from the asymmetric conformal prediction / modal-regression literature**. It fits separate calibrated confidence bands for each side of the spread, validated out-of-sample on a held-out chronological tail before a pair is ever traded live. 
-
-A pair that fails out-of-sample coverage is marked `REVIEW`, not `PASS` — it never reaches the live book. Combined with an EM-calibrated Kalman filter for dynamic hedge ratio estimation ([`kalman_live.py`](trading_engine/kalman_live.py)), entries are sized off a distribution the data actually supports, not an assumption borrowed from a textbook example.
-
-## 2. Multi-Agent Orchestrator
-*(See [`agents/chat_room.py`](agents/chat_room.py))*
-
-The execution side ([`trading_engine/`](trading_engine/)) is a fully deterministic loop — it never calls a language model. Sitting beside it is an advanced **Multi-Agent Orchestrator** built using the Google Antigravity (AGY) SDK.
-
-When evaluating a trade idea or market event, the Orchestrator delegates tasks to **5 specialized subagents**:
-1. **Live Data Summariser**: Uses a custom tool (`fetch_market_data`) to pull live prices from `yfinance` and summarize the current market context.
-2. **Thesis Ingestor**: Takes the trading idea and builds the strongest possible bullish/bearish case for it.
-3. **Contradictor**: Actively attacks the Ingestor's thesis, looking for flaws, macro headwinds, and structural risks.
-4. **Quant**: Uses a custom tool (`get_portfolio_state`) to read the live execution book (`state.json`), calculates required position sizes, and assesses margin impact.
-5. **Judge**: Evaluates the arguments from the Ingestor, Contradictor, and Quant, and delivers a final Go/No-Go verdict.
-
-**Design principle: "Narrator, not decider."** The LLM layer receives pre-computed numbers as input and produces human-readable commentary as output. It has zero write access back into the execution layer.
+- **Core languages & frameworks:** Python 3.10+, FastAPI (ASGI signal server), Streamlit (macro dashboard), Pydantic (typed schema validation across the signal API and agent I/O).
+- **AI / agents:** Claude Agent SDK (managed agents) + Google Antigravity (AGY) SDK for multi-agent orchestration, running Claude Sonnet 4 + Gemini in multi-model debate; Nemotron 120B via Doubleword (signal narratives); Claude Workbench (agent prompt design & evaluation).
+- **Statistical & quant modelling:**
+  - Custom Asymmetric Conformal Predictor (two-piece split-conformal modal regression)
+  - `pykalman` — EM-calibrated state-space model for dynamic hedge ratios
+  - `statsmodels` — order-robust Engle-Granger cointegration (both orderings, worse p-value)
+- **Data, execution & tooling:** `yfinance`, `pandas`, MetaTrader 5 (MT5) execution engine, Obsidian (research vault + dated markdown advisory reports).
 
 ---
 
