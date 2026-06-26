@@ -65,6 +65,7 @@ flowchart TD
         B4 -->|get_portfolio_state tool| S4
     end
 
+    classDef default fill:#ffffff,stroke:#64748b,stroke-width:1px,color:#0f172a
     classDef offline fill:#e2e8f0,stroke:#64748b,stroke-width:1px,color:#0f172a
     classDef live fill:#dcfce7,stroke:#22c55e,stroke-width:2px,color:#14532d
     classDef advisory fill:#dbeafe,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
