@@ -27,14 +27,17 @@ RUN (on the VPS, in the repo folder, in its OWN window — NOT the trading loop'
 
 import os
 import json
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import requests
 import MetaTrader5 as mt5
 
 # Reuse connect() from your executor; NO order functions are used here.
-import mt5_executor as ex   
+import mt5_executor as ex
 
 # ---------------------------------------------------------------------------
 # CONFIG

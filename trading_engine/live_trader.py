@@ -28,6 +28,7 @@ import time
 import tempfile
 import itertools
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Set, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -93,7 +94,7 @@ STREAK_FILE  = "streaks.json"
 # ---------------------------------------------------------------------------
 # ASSET CLASS HELPERS
 # ---------------------------------------------------------------------------
-def asset_class(symbol):
+def asset_class(symbol: str) -> str:
     if symbol in METALS:
         return "METALS"
     if symbol in CRYPTO:
@@ -104,7 +105,7 @@ def asset_class(symbol):
 # ---------------------------------------------------------------------------
 # STATE (atomic JSON)
 # ---------------------------------------------------------------------------
-def _atomic_write(path, obj):
+def _atomic_write(path: str, obj: Any) -> None:
     dir_name = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
@@ -121,18 +122,18 @@ def _atomic_write(path, obj):
         raise
 
 
-def _load_json(path, default):
+def _load_json(path: str, default: Any) -> Any:
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
     return default
 
 
-def load_state():
+def load_state() -> Dict[str, Any]:
     return _load_json(STATE_FILE, {})
 
 
-def save_state(state):
+def save_state(state: Dict[str, Any]) -> None:
     _atomic_write(STATE_FILE, state)
 
 
@@ -144,7 +145,7 @@ def save_streaks(streaks):
     _atomic_write(STREAK_FILE, streaks)
 
 
-def reconcile(state):
+def reconcile(state: Dict[str, Any]) -> Dict[str, Any]:
     """Drop pairs whose legs are no longer open at the broker (live only)."""
     if ex.DRY_RUN:
         return state
@@ -165,7 +166,7 @@ def reconcile(state):
     return alive
 
 
-def _flatten_symbols(symbols, comment="flatten"):
+def _flatten_symbols(symbols: Set[str], comment: str = "flatten") -> None:
     for p in (mt5.positions_get() or []):
         if p.magic == ex.MAGIC_FX and p.symbol in symbols:
             close_dir = -1 if p.type == mt5.POSITION_TYPE_BUY else +1

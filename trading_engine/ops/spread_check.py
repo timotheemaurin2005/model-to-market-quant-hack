@@ -12,6 +12,10 @@ Round-trip cost in spread-price units = (ask-bid)_A + |beta| * (ask-bid)_B
 Run ON the VPS from the repo folder (it imports live_trader). Reads live MT5 spreads.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import MetaTrader5 as mt5
 import mt5_executor as ex
 from live_trader import (FX_UNIVERSE, PAIRS, get_closes, fit_pair, passes_screen,

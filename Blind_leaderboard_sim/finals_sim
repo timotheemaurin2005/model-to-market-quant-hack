@@ -1,0 +1,194 @@
+"""
+finals_sim.py — Monte Carlo rank simulator for the Model-to-Market Finals.
+
+WHAT THIS DOES (honestly):
+  - It does NOT predict anyone's specific positions. You cannot invert P&L back to
+    "they hold X lots of SOL" — many position sets give the same P&L. Claiming
+    otherwise would be fake precision.
+  - It DOES infer each player's RISK PROFILE (drift + volatility) from their
+    leaderboard stats, then Monte-Carlo's every player's equity forward over the
+    remaining hours, re-ranking the whole field each run.
+  - Output: probability YOU finish in top-25 / top-10, expected rank, and which
+    leaders are most likely to blow up and fall past you (the attrition you benefit
+    from).
+
+HOW THE RISK PROFILE IS INFERRED (stated assumptions, tweak freely):
+  - Each player's realised P&L over the elapsed finals hours implies an hourly drift.
+  - Their volatility is inferred from win-rate + a "swinginess" proxy: high P&L with
+    moderate win-rate => high per-trade variance (big swinger); steady P&L with high
+    win-rate => low variance (grinder). Sharpe (if populated) overrides this.
+  - We simulate hourly equity steps as drift + N(0, vol). Players with high vol have
+    fat outcomes (can moon OR blow up). A liquidation floor removes blow-ups from the
+    ranking (forced-liquidation = elimination), which is how you gain rank.
+
+EDIT THE DATA BLOCK with the real leaderboard numbers from your screenshots.
+"""
+
+import numpy as np
+from dataclasses import dataclass
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+START_EQUITY = 1_000_000
+LIQUIDATION_FLOOR = 700_000     # ~stop-out / blow-up level; below this = eliminated
+HOURS_ELAPSED = 20              # finals hours already traded at snapshot time
+HOURS_REMAINING = 28           # hours left until Fri 22:00 close
+N_SIMS = 20_000
+YOUR_NAME = "YOU"
+
+# ---------------------------------------------------------------------------
+# LEADERBOARD DATA  --  replace with the real numbers from your screenshots.
+# (name, final_score, pnl_usd, win_rate_pct, sharpe)  Sharpe 0.0 = unknown.
+# ---------------------------------------------------------------------------
+LEADERBOARD = [
+    ("sxmi.ai",        78.54,  171595, 43, 0.0),
+    ("Alistair Bill",  78.13,   95522, 65, 0.0),
+    ("Him",            75.00,  702496, 78, 0.0),
+    ("Jiahua Xu",      74.29,  608599, 54, 0.0),
+    ("Ajay",           73.59,  574345, 90, 0.0),
+    ("im tired boss",  72.88,  508191, 57, 0.0),
+    ("Edison",         72.17,  473606, 56, 0.0),
+    ("Arhham Jimit",   71.46,  435951, 52, 0.0),
+    ("Batuhan Kale",   70.76,  384076, 56, 0.0),
+    ("Valerii O.",     70.05,  281536, 85, 0.0),
+    # ---- fill in the rest of the top 100 from your screenshots ----
+    # Approximate filler so the sim runs end-to-end; REPLACE with real rows.
+    *[(f"player_{i}", 70.0 - i*0.45, max(5000, 260000 - i*2600),
+       50, 0.0) for i in range(11, 101)],
+]
+
+# Your live position (override the filler entry for yourself):
+YOUR_PNL = 70824   # equity 1,070,824
+
+
+# ---------------------------------------------------------------------------
+# RISK-PROFILE INFERENCE
+# ---------------------------------------------------------------------------
+@dataclass
+class Player:
+    name: str
+    equity: float
+    drift_hr: float      # inferred mean hourly $ change
+    vol_hr: float        # inferred hourly $ stddev
+
+def infer_profile(name, pnl, win_rate, sharpe):
+    equity = START_EQUITY + pnl
+    drift_hr = pnl / max(HOURS_ELAPSED, 1)   # naive: assume linear so far
+
+    # Volatility proxy. If Sharpe is known and non-zero, back it out:
+    # Sharpe ~ mean_step / std_step  ->  std_step = mean_step / Sharpe.
+    if sharpe and abs(sharpe) > 0.01:
+        std_step = abs(drift_hr) / abs(sharpe)
+    else:
+        # No Sharpe: infer from magnitude + win-rate.
+        # Big P&L with moderate win-rate => high variance (swinger).
+        # Smaller P&L with high win-rate  => low variance (grinder).
+        base = abs(pnl) / max(HOURS_ELAPSED, 1)
+        # win-rate 50% -> multiplier ~2.0 (lots of variance); 90% -> ~0.6 (smooth)
+        wr = np.clip(win_rate / 100.0, 0.3, 0.95)
+        swing_mult = 2.6 - 2.2 * wr
+        std_step = max(base * swing_mult, 3000)
+    return Player(name, equity, drift_hr, vol_hr=std_step)
+
+
+def build_field():
+    field = []
+    for name, score, pnl, wr, sharpe in LEADERBOARD:
+        field.append(infer_profile(name, pnl, wr, sharpe))
+    # add YOU as a grinder profile (low vol) by default
+    field.append(Player(YOUR_NAME, START_EQUITY + YOUR_PNL,
+                        drift_hr=YOUR_PNL / max(HOURS_ELAPSED, 1),
+                        vol_hr=4000))   # low-variance grinder; raise to model swinging
+    return field
+
+
+# ---------------------------------------------------------------------------
+# MONTE CARLO
+# ---------------------------------------------------------------------------
+def simulate(field, your_vol=None):
+    n = len(field)
+    your_idx = next(i for i, p in enumerate(field) if p.name == YOUR_NAME)
+    if your_vol is not None:
+        field[your_idx].vol_hr = your_vol
+
+    drift = np.array([p.drift_hr for p in field])
+    vol   = np.array([p.vol_hr for p in field])
+    eq0   = np.array([p.equity for p in field])
+
+    your_ranks = np.empty(N_SIMS, dtype=int)
+    top25 = top10 = top5 = 0
+    # track how often each current top-10 player blows up (falls below floor)
+    blowups = np.zeros(n)
+
+    for s in range(N_SIMS):
+        # cumulative drift + random walk over remaining hours
+        shock = np.random.normal(0, 1, (n, HOURS_REMAINING)) * vol[:, None]
+        path = eq0[:, None] + drift[:, None] * np.arange(1, HOURS_REMAINING + 1) + np.cumsum(shock, axis=1)
+        final_eq = path[:, -1]
+        min_eq = path.min(axis=1)
+
+        # blow-ups: hit liquidation floor at any point => eliminated (rank to bottom)
+        eliminated = min_eq <= LIQUIDATION_FLOOR
+        blowups += eliminated
+        ranked_eq = np.where(eliminated, -1e18, final_eq)  # eliminated sink to bottom
+
+        order = np.argsort(-ranked_eq)            # descending
+        rank_of = np.empty(n, dtype=int)
+        rank_of[order] = np.arange(1, n + 1)
+        r = rank_of[your_idx]
+        your_ranks[s] = r
+        top25 += r <= 25
+        top10 += r <= 10
+        top5  += r <= 5
+
+    return {
+        "ranks": your_ranks,
+        "p_top25": top25 / N_SIMS,
+        "p_top10": top10 / N_SIMS,
+        "p_top5":  top5 / N_SIMS,
+        "median_rank": int(np.median(your_ranks)),
+        "blowup_rate": blowups / N_SIMS,
+        "field": field,
+    }
+
+
+def report(res, label):
+    print(f"\n===== {label} =====")
+    print(f"  Median finish rank : {res['median_rank']}")
+    print(f"  P(top 25)          : {res['p_top25']*100:5.1f}%")
+    print(f"  P(top 10)          : {res['p_top10']*100:5.1f}%")
+    print(f"  P(top 5)           : {res['p_top5']*100:5.1f}%")
+    p10 = np.percentile(res["ranks"], [10, 50, 90])
+    print(f"  Rank 10/50/90 pct  : {int(p10[0])} / {int(p10[1])} / {int(p10[2])}")
+
+
+if __name__ == "__main__":
+    print("Model-to-Market Finals — Monte Carlo rank simulator")
+    print(f"Sims: {N_SIMS} | hours left: {HOURS_REMAINING} | liquidation floor: ${LIQUIDATION_FLOOR:,}")
+
+    # Scenario A: you GRIND (low variance)
+    field = build_field()
+    resA = simulate(field, your_vol=4000)
+    report(resA, "Scenario A — YOU grind (low variance, vol=4k/hr)")
+
+    # Scenario B: you take MODERATE directional risk
+    field = build_field()
+    resB = simulate(field, your_vol=15000)
+    report(resB, "Scenario B — YOU push (moderate risk, vol=15k/hr)")
+
+    # Scenario C: you SWING BIG
+    field = build_field()
+    resC = simulate(field, your_vol=45000)
+    report(resC, "Scenario C — YOU swing big (high risk, vol=45k/hr) — note blow-up tail")
+
+    # Attrition: which current leaders most likely blow up (you benefit)
+    print("\n===== Attrition: P(blow-up) for current top 10 =====")
+    field = build_field()
+    res = simulate(field, your_vol=4000)
+    for p, b in sorted(zip(field, res["blowup_rate"]), key=lambda x: -x[1])[:10]:
+        if p.name != YOUR_NAME:
+            print(f"  {p.name:16} blow-up prob: {b*100:5.1f}%   (vol≈${p.vol_hr:,.0f}/hr)")
+
+    print("\nNOTE: these are model estimates from inferred risk profiles, not real "
+          "positions. The board is blinded — treat as directional, not precise.")

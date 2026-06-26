@@ -16,8 +16,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# Ensure the trading directory is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Ensure the trading_engine directory is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "trading_engine"))
 
 from conformal import (
     ConformalFit,

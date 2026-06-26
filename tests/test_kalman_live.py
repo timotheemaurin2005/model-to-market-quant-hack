@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "trading_engine"))
 
 from kalman_live import load_config, filter_update, current_beta
 

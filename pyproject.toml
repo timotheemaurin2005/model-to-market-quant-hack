@@ -1,0 +1,23 @@
+[project]
+name = "model-to-market"
+version = "1.0.0"
+description = "Cointegration stat-arb engine + Claude macro advisory layer for the Model to Market: The Quantitative Hack competition"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Timothée Maurin"},
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["trading_engine"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]  # line length handled by formatter

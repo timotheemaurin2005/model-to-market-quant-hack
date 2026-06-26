@@ -1,5 +1,29 @@
+# Secrets — never commit
 .env
+.env.*
+!.env.example
+!*/.env.example
+*credential*
+*secret*
+
+# Live/runtime state — local to a session, not part of the codebase
+state.json
+*_state.json
+streaks.json
+trade_state.json
+dry_overnight.log
+
+# Python
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
+
+# OS / IDE
 .DS_Store
+
+# Data (large, regenerated locally — not checked in)
 *.parquet
+outputs/
+logs/
+data/

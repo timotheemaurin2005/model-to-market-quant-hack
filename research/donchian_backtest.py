@@ -11,6 +11,10 @@ Trend systems have LOW win rates (~35-45%) — judge on profit factor & net retu
 NOT win rate.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "trading_engine"))
+
 import numpy as np
 import pandas as pd
 import MetaTrader5 as mt5

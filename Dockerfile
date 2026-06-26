@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+LABEL maintainer="Timothée Maurin"
+LABEL description="Signal server for the Model to Market stat-arb engine"
+
 WORKDIR /app
 
 # System deps for statsmodels / numpy build (if needed from source)

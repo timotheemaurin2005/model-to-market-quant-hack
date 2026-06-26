@@ -17,8 +17,12 @@ PROTECTIONS
 - Own magic number — isolates this book for P&L and reconciliation.
 """
 
+import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "trading_engine"))
+
 import pandas as pd
 import MetaTrader5 as mt5
 

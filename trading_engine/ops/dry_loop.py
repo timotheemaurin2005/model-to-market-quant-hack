@@ -16,7 +16,11 @@ RUN:  python dry_loop.py
 STOP: Ctrl+C.
 """
 
+import sys
 import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import mt5_executor as ex
 ex.DRY_RUN = True                    # pin dry for this whole process, BEFORE importing the loop
 import live_trader as lt

@@ -53,17 +53,20 @@ parquet  →  pair_screener.py  →  ranked_pairs.csv
   until after Round 3 (tech-prize requirement is to make it public then).
 
 ## Strategy parameters (current)
-- Cointegration: ADF p < 0.05 on the spread.
-- Entry |Z| = 2.0, exit |Z| = 0.5 (placeholders — tune via PnL backtest).
-- Conformal sizing: two-piece modal regression, coverage α = 0.9, asymmetric
-  intervals; size = base / (1 + λ·width). Asymmetric CP beats OLS CP above scale
-  ratio r ≈ 3–4 (~16–19% efficiency gain).
-- Tiered conviction sizing (× guardrail ceiling):
-  - |Z|>2.5 AND r>4 AND half_life>3h → 0.90
-  - |Z|>2.0 AND r>3 → 0.60
-  - otherwise → 0.30
-- Target pairs: XAUUSD/XAGUSD, EURUSD/EURGBP, EURUSD/EURCHF, EURGBP/EURCHF.
-  Crypto excluded (decouples faster than the 15-min loop can act).
+- **Core FX Stat-Arb (`live_trader.py`)**:
+  - `MAX_CONCURRENT_PAIRS = 8`
+  - `ENTRY_Z = 1.75`
+  - `EXIT_Z = 0.25`
+  - Cointegration: ADF p < 0.05 on the spread.
+- **Offensive Gold Sleeve (`directional_sleeve.py`)**:
+  - `SYMBOL = XAUUSD` (Short Only)
+  - `MAGIC_GOLD = 20260703`
+  - `TRANCHE_MARGIN_USD = 50000.0`
+  - `MAX_TRANCHES = 3`
+  - `STOP_LOSS_PRICE = 4250.0` (Hard Adverse Stop)
+  - `KILL_SWITCH_USD = -100000.0` (Cumulative Book PnL stop)
+  - Scaling: Only add next tranche if price is lower than previous entry.
+  - Data Caution: News blackout block on June 24 (GDP) & June 26 (PCE) if Gold is rallying.
 
 ## Files
 - `pair_screener.py` — cointegration + half-life screen.

@@ -13,7 +13,8 @@ KEY SAFETY DESIGN
   dry-run-tested (passes dry_run=True) on the SAME account.
 - Sizing/risk use the broker's own calculator (order_calc_margin), so currency
   conversion is correct, never hand-rolled.
-- Credentials come from the environment (MT5_PASSWORD), never the repo.
+- Credentials come from the environment (MT5_LOGIN, MT5_SERVER, MT5_PASSWORD),
+  never the repo.
 
 CHANGE (magic split + SL):
 - MAGIC is no longer one shared tag. Each sleeve has its own so they can be told
@@ -35,8 +36,8 @@ import MetaTrader5 as mt5
 # ---------------------------------------------------------------------------
 DRY_RUN = False            # FX core default. Live for Round 2. Per-call override exists.
 
-LOGIN    = 10301
-SERVER   = "3.11.134.149:443"
+LOGIN    = int(os.environ.get("MT5_LOGIN", "0"))
+SERVER   = os.environ.get("MT5_SERVER")
 PASSWORD = os.environ.get("MT5_PASSWORD")
 
 MAX_MARGIN_USAGE = 0.85
@@ -53,8 +54,8 @@ MAGIC     = MAGIC_DIR      # backward-compat alias for any code importing MAGIC
 # CONNECTION
 # ---------------------------------------------------------------------------
 def connect():
-    if PASSWORD is None:
-        raise RuntimeError("MT5_PASSWORD env var is not set on this machine.")
+    if not LOGIN or not SERVER or PASSWORD is None:
+        raise RuntimeError("MT5_LOGIN, MT5_SERVER, and MT5_PASSWORD env vars must all be set.")
     if not mt5.initialize(login=LOGIN, password=PASSWORD, server=SERVER):
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
     term = mt5.terminal_info()
